@@ -16,6 +16,9 @@ findCellRangesKernel(const unsigned int* __restrict__ d_sorted_keys,
                      unsigned int* __restrict__ d_cell_end_indices,
                      int num_particles);
 
+/* Helper kernel for calculating the 2D Poly6 kernel weight */
+__device__ inline float computePoly6(float r2, float h2, float h);
+
 /* Compute density for SPH  */
 __global__ void
 computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,

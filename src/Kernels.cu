@@ -61,6 +61,18 @@ findCellRangesKernel(const unsigned int* __restrict__ d_sorted_keys,
     }
 }
 
+/* Helper kernel for calculating the 2D Poly6 kernel weight */
+__device__ inline float computePoly6(float r2, float h2, float h) {
+    if (r2 >= h2)
+        return 0.0f;
+
+    // 2D Poly6 formula: 4 / (pi * h^8) * (h^2 - r^2)^3
+    // source: https://dl.acm.org/doi/full/10.1145/3799902.3811052
+    const float term = h2 - r2;
+    const float coeff = 4.0f / (CUDART_PI_F * powf(h, 8.0f));
+    return coeff * term * term * term;
+}
+
 /* Compute density for SPH  */
 __global__ void
 computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
@@ -130,16 +142,12 @@ computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
                 /* Check if neighbor is in range of particle based on smoothing
                    radius. If neighbor is in radius, Use 2D Poly6 smoothing
                    function to calculate impact of neighbor on particle. */
+                // 2D Poly6 formula: 4 / (pi * h^8) * (h^2 - r^2)^3
+                // source: https://dl.acm.org/doi/full/10.1145/3799902.3811052
                 // h = smoothing radius,
                 // r = distance between particle and neighbor,
-                // q = ratio of how far neighbor is from particle,
-                // w = Poly6 kernel weight value
                 if (r2 <= h2) {
-                    const float r = sqrtf(r2);
-                    const float q = (h - r) / h;
-                    const float w =
-                        315.0f / (64.0f * CUDART_PI_F * h * h * h) * q * q * q;
-                    density += params.particle_mass * w;
+                    density += computePoly6(r2, h2, h);
                 }
             }
         }
@@ -149,14 +157,14 @@ computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
     d_density[idx] = density;
 }
 
-/* Helper kernel for calculating the Spiky gradient */
+/* Helper kernel for calculating the 2D Spiky gradient */
 __device__ inline float2 computeSpikyGradient(float2 r_ij, float r, float h) {
     if (r <= 0.0f || r >= h)
         return make_float2(0.0f, 0.0f);
 
-    // Gradient formula: -45 / (pi * h^6) * (h - r)^2 * (r_ij / r)
+    // 2D Spiky gradient formula: -10 / (pi * h^5) * (h - r)^2 * (r_ij / r)
     const float factor =
-        -45.0f / (CUDART_PI_F * powf(h, 6.0f)) * powf(h - r, 2.0f);
+        -10.0f / (CUDART_PI_F * powf(h, 5.0f)) * powf(h - r, 2.0f);
     const float2 normalized_r = make_float2(r_ij.x / r, r_ij.y / r);
 
     return make_float2(factor * normalized_r.x, factor * normalized_r.y);
