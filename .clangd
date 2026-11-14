@@ -1,0 +1,68 @@
+# Nsight VS Code Edition clangd starter config for CUDA C++ projects.
+
+CompileFlags:
+  Compiler: clang++
+
+  # Directory that contains compile_commands.json
+  CompilationDatabase: build
+
+  Add:
+    - --cuda-path=/usr/local/cuda-13.4
+    - -I/usr/local/cuda-13.4/targets/x86_64-linux/include
+    - -I/usr/local/cuda-13.4/targets/x86_64-linux/include/cccl
+
+    # Project includes
+    - -I/home/bwolek/FluidSim/include
+    - -I/home/bwolek/FluidSim/src
+    - -I/home/bwolek/FluidSim/tests
+    - -I/home/bwolek/FluidSim/libraries/nlohmann/include
+    - -I/home/bwolek/FluidSim/libraries/glad/include
+
+    - --cuda-gpu-arch=sm_89
+    - -std=c++20
+
+    - -Wno-unknown-cuda-version
+    - -Wno-pragma-system-header-outside-header
+
+  Remove:
+    - -G
+    - -stdpar
+    - "-Xfatbin*"
+    - "-Xcompiler*"
+    - "-Xcudafe*"
+    - "-rdc=*"
+    - "-gpu=*"
+    - "--diag_suppress*"
+    - "-gencode*"
+    - "--generate-code*"
+    - -fcoroutines
+    - "-ccbin*"
+    - "--compiler-options*"
+    - "--extended-lambda"
+    - "--expt-extended-lambda"
+    - "--expt-relaxed-constexpr"
+    - "-forward-unknown-to-host-compiler"
+    - "-Werror=cross-execution-space-call"
+    - "-allow-unsupported-compiler"
+
+---
+
+# Force CUDA language mode for .cu, .cuh, and test files
+If:
+  PathMatch: '.*(\.cu|\.cuh|\.cpp)$'
+CompileFlags:
+  Add:
+    - -x
+    - cuda
+    - -I/home/bwolek/FluidSim/include
+    - -I/home/bwolek/FluidSim/src
+    - -I/home/bwolek/FluidSim/tests
+    - -I/home/bwolek/FluidSim/libraries/nlohmann/include
+    - -I/home/bwolek/FluidSim/libraries/glad/include
+Diagnostics:
+  Suppress:
+    - "variadic_device_fn"
+    - "attributes_not_allowed"
+    - "template_param_shadow"
+    - "deduction_guide_target_attr"
+    - "shared_var_init"

@@ -1,0 +1,21 @@
+# Build directories
+build/
+bin/
+lib/
+
+# CMake generated files
+CMakeCache.txt
+CMakeFiles/
+cmake-install.cmake
+Makefile
+*.cmake
+
+# Binaries & Object files
+*.o
+*.obj
+*.exe
+*.out
+FluidSimTest
+
+# IDE files
+.vscode/

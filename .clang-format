@@ -1,0 +1,6 @@
+BasedOnStyle: LLVM
+PointerAlignment: Left
+# UseTab: Always
+IndentWidth: 4
+AccessModifierOffset: -4
+# TabWidth: 4
