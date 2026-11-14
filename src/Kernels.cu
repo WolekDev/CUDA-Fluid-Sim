@@ -170,7 +170,7 @@ __device__ inline float2 computeSpikyGradient(float2 r_ij, float r, float h) {
     return make_float2(factor * normalized_r.x, factor * normalized_r.y);
 }
 
-/* Compute Advection and Gradient */
+/* Computes Velocity Advection and Gradient Coupling Vector */
 __global__ void computeAdvectionAndGradientKernel(
     const float2* __restrict__ d_pos, const float2* __restrict__ d_vel,
     const float2* __restrict__ d_force_ext, float2* __restrict__ d_vel_adv,
@@ -282,4 +282,134 @@ __global__ void computeAdvectionAndGradientKernel(
     float dt_sq = delta_time * delta_time;
     d_grad_coup_vect[p_idx] =
         make_float2(-dt_sq * d_ii_sum.x, -dt_sq * d_ii_sum.y);
+}
+
+/* Initialize pressure solver. Calculates density advection, initial pressure,
+ * and the diagonal coefficient for the pressure matrix. */
+__global__ void initPressureSolverKernel(
+    const float2* __restrict__ d_pos, const float2* __restrict__ d_vel_adv,
+    const float* __restrict__ d_density, float* __restrict__ d_density_adv,
+    const float2* __restrict__ d_grad_coup_vect,
+    const unsigned int* __restrict__ d_sorted_values,
+    const unsigned int* __restrict__ d_cell_start_indices,
+    const unsigned int* __restrict__ d_cell_end_indices,
+    float* __restrict__ d_pressure, const float* __restrict__ d_pressure_prev,
+    float* __restrict__ d_diag_coeff, int num_particles,
+    SimulationParams params, float delta_time) {
+
+    // Get particle's unique index
+    const int idx = blockDim.x * blockIdx.x + threadIdx.x;
+    if (idx >= num_particles)
+        return;
+
+    // Extract pos, vel, and mass of particle
+    const unsigned int p_idx = d_sorted_values[idx];
+    const float2 pos_i = d_pos[p_idx];
+    const float mass = params.particle_mass;
+
+    // Get cell coordinates for particle
+    const int cx = static_cast<int>(
+        floorf((pos_i.x - params.domain_min_x) / params.smoothing_radius));
+    const int cy = static_cast<int>(
+        floorf((pos_i.y - params.domain_min_y) / params.smoothing_radius));
+
+    // Smothing radius for future calculations
+    const float h = params.smoothing_radius;
+    const float h2 = h * h;
+
+    // init sums
+    float density_adv_sum = 0.0f;
+    float a_ii_sum = 0.0f;
+
+    // d_ii and vel adv for the current particle.
+    const float2 d_ii = d_grad_coup_vect[p_idx];
+    const float2 vel_adv_i = d_vel_adv[p_idx];
+
+    // Calculate Pi^0 (initial guess for pressure solver)
+    // Pi^0 = 0.5pi(t − ∆t)
+    d_pressure[p_idx] = 0.5 * d_pressure_prev[p_idx];
+
+    // Loop through neighboring cells on x-axis
+    for (int i = cx - 1; i <= cx + 1; i++) {
+        // Ensure x bounds
+        if (i < 0 || i >= params.grid_width)
+            continue;
+
+        // Loop through neighboring cells on y-axis
+        for (int j = cy - 1; j <= cy + 1; j++) {
+            // Ensure y bounds
+            if (j < 0 || j >= params.grid_height)
+                continue;
+
+            // Get hash key for the target cell
+            const unsigned int hi = static_cast<unsigned int>(i);
+            const unsigned int hj = static_cast<unsigned int>(j);
+            const unsigned int key = hj * params.grid_width + hi;
+
+            // Get start and end index for particles in this cell
+            const unsigned int start_index = d_cell_start_indices[key];
+            const unsigned int end_index = d_cell_end_indices[key];
+
+            // Ensure that the start index is before the end and that the
+            // indexes are not default value (unmodified)
+            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
+                end_index == 0xFFFFFFFFu)
+                continue;
+
+            // Loop through all particles in cell range
+            for (unsigned int k = start_index; k < end_index; ++k) {
+
+                // Get neighbor position
+                const unsigned int neighbor_idx = d_sorted_values[k];
+                const float2 pos_j = d_pos[neighbor_idx];
+
+                // Calculate distance between main particle and neighbor
+                const float2 r_ij =
+                    make_float2(pos_i.x - pos_j.x, pos_i.y - pos_j.y);
+                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+
+                // For all neighbors in range, calculate weighted contribution
+                // to density adv.
+                // Formula:
+                // rho_adv_sum += mass * (relative_vel_adv dot gradient)
+
+                // Also, calculate a_ii the diagonal coefficient.
+                // Formula:
+                // a_ii_sum += mass * ( (d_ii - d_ji) dot gradient)
+                if (r2 > 0.0f && r2 < h2) {
+                    const float r = sqrtf(r2);
+
+                    // Density adv
+                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+
+                    const float2 neighbor_vel_adv = d_vel_adv[neighbor_idx];
+                    const float2 relative_vel_adv =
+                        make_float2(vel_adv_i.x - neighbor_vel_adv.x,
+                                    vel_adv_i.y - neighbor_vel_adv.y);
+
+                    const float dot_product_density =
+                        relative_vel_adv.x * grad_w_ij.x +
+                        relative_vel_adv.y * grad_w_ij.y;
+
+                    density_adv_sum += mass * dot_product_density;
+
+                    // a_ii sum
+                    const float2 d_ji = d_grad_coup_vect[neighbor_idx];
+                    const float2 d_diff =
+                        make_float2(d_ii.x - d_ji.x, d_ii.y - d_ji.y);
+
+                    // Negate the dot product to account for the gradient vector
+                    // orientation
+                    const float dot_product_a_ii =
+                        -(d_diff.x * grad_w_ij.x + d_diff.y * grad_w_ij.y);
+
+                    a_ii_sum += mass * dot_product_a_ii;
+                }
+            }
+        }
+    }
+
+    // Finish calculating density adv and a_ii
+    d_density_adv[p_idx] = density_adv_sum * delta_time + d_density[p_idx];
+    d_diag_coeff[p_idx] = a_ii_sum;
 }

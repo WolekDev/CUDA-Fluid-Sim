@@ -16,7 +16,7 @@
         ]
     },
     "simulation": {
-        "max_particles": 10,
+        "max_particles": 3,
         "time_step": 0.01,
         "gravity": [
             0.0,

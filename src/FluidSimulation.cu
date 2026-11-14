@@ -56,17 +56,28 @@ void FluidSimulation::initialize(const std::string& config_file) {
     h_params.grid_height = h_grid_height;
 
     // Allocate particle buffers
-    cudaMalloc(&d_pos, h_max_particles * sizeof(float2));    // Position array
-    cudaMalloc(&d_density, h_max_particles * sizeof(float)); // Density array
-    cudaMalloc(&d_predicted_density,
-               h_max_particles * sizeof(float)); // Predicted density array
-    cudaMalloc(&d_pressure, h_max_particles * sizeof(float)); // Pressure array
-    cudaMalloc(&d_vel, h_max_particles * sizeof(float2));     // Velocity array
-    cudaMalloc(&d_vel_adv,
-               h_max_particles * sizeof(float2)); // Advection velocity array
-    cudaMalloc(&d_grad_coup_vect,
-               h_max_particles *
-                   sizeof(float2)); // Gradient Coupling Vector (dii) array
+
+    // Position
+    cudaMalloc(&d_pos, h_max_particles * sizeof(float2));
+
+    // Density & Density Adv
+    cudaMalloc(&d_density, h_max_particles * sizeof(float));
+    cudaMalloc(&d_density_adv, h_max_particles * sizeof(float));
+
+    // Pressure & Previous Pressure
+    cudaMalloc(&d_pressure, h_max_particles * sizeof(float));
+    cudaMalloc(&d_pressure_prev, h_max_particles * sizeof(float));
+    cudaMemset(d_pressure_prev, 0.0f, h_max_particles * sizeof(float));
+
+    // Velocity & Velocity Advection
+    cudaMalloc(&d_vel, h_max_particles * sizeof(float2));
+    cudaMalloc(&d_vel_adv, h_max_particles * sizeof(float2));
+
+    // Gradient Coupling Vector (dii)
+    cudaMalloc(&d_grad_coup_vect, h_max_particles * sizeof(float2));
+
+    // Diagonal Coefficient for Pressure Matrix (aii)
+    cudaMalloc(&d_diag_coeff, h_max_particles * sizeof(float));
 
     // Allocate hash key & value arrays
     cudaMalloc(&d_keys_in,
@@ -115,6 +126,16 @@ void FluidSimulation::update(float delta_time) {
         d_pos, d_vel, nullptr, d_vel_adv, d_density, d_grad_coup_vect,
         d_values_out, d_cell_start_indices, d_cell_end_indices,
         current_particles, h_params, delta_time);
+
+    // Initialize Pressure Solver
+    // Calculates density adv, initial pressure, and a_ii
+    initPressureSolverKernel<<<gridSize, kBlockSize>>>(
+        d_pos, d_vel_adv, d_density, d_density_adv, d_grad_coup_vect,
+        d_values_out, d_cell_start_indices, d_cell_end_indices, d_pressure,
+        d_pressure_prev, d_diag_coeff, current_particles, h_params, delta_time);
+
+    // Future note, after all main logic, calculate d_pressure_prev for next
+    // iteration.
 
     // Check if an error occured while launching the kernel
     cudaError_t err = cudaGetLastError();
@@ -167,7 +188,7 @@ void FluidSimulation::cleanup() {
     cudaFree(d_pos);
     cudaFree(d_vel);
     cudaFree(d_density);
-    cudaFree(d_predicted_density);
+    cudaFree(d_density_adv);
     cudaFree(d_pressure);
     cudaFree(d_keys_in);
     cudaFree(d_keys_out);
@@ -180,7 +201,7 @@ void FluidSimulation::cleanup() {
     cudaFree(d_grad_coup_vect);
 
     d_pos = d_vel = d_vel_adv = d_grad_coup_vect = nullptr;
-    d_density = d_predicted_density = d_pressure = nullptr;
+    d_density = d_density_adv = d_pressure = nullptr;
     d_keys_in = d_keys_out = nullptr;
     d_values_in = d_values_out = nullptr;
     d_cell_start_indices = d_cell_end_indices = nullptr;
@@ -188,7 +209,7 @@ void FluidSimulation::cleanup() {
     pointers_allocated = false;
 }
 
-/* Debug function: Setter for test particles */
+/* Debug function: Uploads test particles for the simulation. */
 void FluidSimulation::uploadTestParticles(const std::vector<float2>& pts) {
     if (pts.size() > static_cast<size_t>(h_max_particles)) {
         throw std::runtime_error(
@@ -204,7 +225,7 @@ void FluidSimulation::uploadTestParticles(const std::vector<float2>& pts) {
     }
 }
 
-/* Debug function: Getter for keys from host. */
+/* Debug function: Copies keys array from device to host. */
 std::vector<unsigned int> FluidSimulation::copyKeysToHost() {
     std::vector<unsigned int> host_keys(h_max_particles);
     cudaError_t err = cudaMemcpy(host_keys.data(), d_keys_out,
@@ -217,7 +238,7 @@ std::vector<unsigned int> FluidSimulation::copyKeysToHost() {
     return host_keys;
 }
 
-/* Debug function: Getter for densities. */
+/* Debug function: Copies the density array from device to host. */
 std::vector<float> FluidSimulation::copyDensitiesToHost() {
     std::vector<float> host_densities(h_max_particles);
     cudaError_t err =
@@ -231,7 +252,7 @@ std::vector<float> FluidSimulation::copyDensitiesToHost() {
     return host_densities;
 }
 
-/* Debug function: Getter for Velocity Advection. */
+/* Debug function: Copies the Velocity Adv array from device to host. */
 std::vector<float2> FluidSimulation::copyVelAdvToHost() const {
     std::vector<float2> h_vel_adv(h_active_particle_count);
     if (d_vel_adv != nullptr && h_active_particle_count > 0) {
@@ -242,7 +263,7 @@ std::vector<float2> FluidSimulation::copyVelAdvToHost() const {
     return h_vel_adv;
 }
 
-/* Debug function: Getter for Gradient Coupling Vector. */
+/* Debug function: Copies the Gradient Coupling Vector from device to host. */
 std::vector<float2> FluidSimulation::copyGradCoupToHost() const {
     std::vector<float2> h_grad_coup(h_active_particle_count);
     if (d_grad_coup_vect != nullptr && h_active_particle_count > 0) {
@@ -251,4 +272,38 @@ std::vector<float2> FluidSimulation::copyGradCoupToHost() const {
                    cudaMemcpyDeviceToHost);
     }
     return h_grad_coup;
+}
+
+/* Debug function: Copies the advective density buffer from device to host. */
+std::vector<float> FluidSimulation::copyDensityAdvToHost() const {
+    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    std::vector<float> h_density_adv(current_particles);
+    if (current_particles > 0 && d_density_adv) {
+        cudaMemcpy(h_density_adv.data(), d_density_adv,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return h_density_adv;
+}
+
+/* Debug function: Copies the pressure diagonal coefficient buffer from device
+ * to host. */
+std::vector<float> FluidSimulation::copyDiagCoeffToHost() const {
+    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    std::vector<float> h_diag_coeff(current_particles);
+    if (current_particles > 0 && d_diag_coeff) {
+        cudaMemcpy(h_diag_coeff.data(), d_diag_coeff,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return h_diag_coeff;
+}
+
+/* Debug function: Copies the pressure buffer from device to host. */
+std::vector<float> FluidSimulation::copyPressureToHost() const {
+    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    std::vector<float> h_pressure(current_particles);
+    if (current_particles > 0 && d_pressure) {
+        cudaMemcpy(h_pressure.data(), d_pressure,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return h_pressure;
 }

@@ -4,7 +4,7 @@
 #include <iostream>
 #include <vector>
 
-// 1. Initialization and Memory Lifecycle Tests
+// Initialization and Memory Lifecycle Tests
 void testInitializationAndMemory() {
     std::cout << "[TEST] Running testInitializationAndMemory...\n";
 
@@ -38,7 +38,7 @@ void testInitializationAndMemory() {
     std::cout << "[Pass] Cleanup executed and pointers reset to nullptr.\n";
 }
 
-// 2. Spatial Hashing & Monotonic CUB Sorting Test
+// Spatial Hashing & Monotonic CUB Sorting Test
 void testSpatialHashingAndSort() {
     std::cout << "\n[TEST] Running testSpatialHashingAndSort...\n";
 
@@ -63,7 +63,7 @@ void testSpatialHashingAndSort() {
     sim.cleanup();
 }
 
-// 3. Density Kernel Accumulation Test
+// Density Kernel Accumulation Test
 void testDensityKernel() {
     std::cout << "\n[TEST] Running testDensityKernel...\n";
 
@@ -75,7 +75,8 @@ void testDensityKernel() {
                                     make_float2(1.8f, 1.8f)};
 
     sim.uploadTestParticles(test_pos);
-    sim.update(0.01f); // Triggers hash, sort, cell ranges, and density kernel
+    // Triggers hash, sort, cell ranges, density, and init pressure kernels
+    sim.update(0.01f);
 
     std::vector<float> densities = sim.copyDensitiesToHost();
 
@@ -86,7 +87,7 @@ void testDensityKernel() {
     sim.cleanup();
 }
 
-// 4. Advection Prediction & Gradient Coupling Vector Test
+// Advection Prediction & Gradient Coupling Vector Test
 void testAdvectionAndGradient() {
     std::cout << "\n[TEST] Running testAdvectionAndGradient...\n";
 
@@ -108,33 +109,72 @@ void testAdvectionAndGradient() {
     std::vector<float2> grad_coup = sim.copyGradCoupToHost();
     const SimulationParams& params = sim.getParams();
 
-    // 1. Verify advective velocity incorporates gravity/external force
-    // v_adv = v_0 + dt * (F_ext / mass) -> with v_0 = 0, y component should
-    // reflect gravity acceleration over dt
+    // Verify advective velocity incorporates gravity/external force
     float expected_y_vel = dt * (params.gravity_vector.y *
                                  params.particle_mass / params.particle_mass);
-    // Simplified: params.gravity_vector.y * dt
 
     assert(vel_adv.size() >= 2);
     // Checking particle 0's y advective velocity
     std::cout << "[Pass] Particle 0 advective velocity y = " << vel_adv[0].y
               << "\n";
 
-    // 2. Verify gradient coupling vector d_ii accumulates neighbor
-    // contributions Particle 0 and 1 are close, so particle 0 should have a
-    // non-zero d_ii vector
+    // Verify gradient coupling vector d_ii accumulates neighbor
+    // contributions
     float d_ii_mag_sq =
         grad_coup[0].x * grad_coup[0].x + grad_coup[0].y * grad_coup[0].y;
     assert(d_ii_mag_sq > 0.0f);
 
-    // Isolated particle 2 shouldn't have neighbors within smoothing radius, so
-    // its d_ii should remain zero
+    // Isolated particle 2 shouldn't have neighbors within smoothing radius
     float d_ii_isolated_sq =
         grad_coup[2].x * grad_coup[2].x + grad_coup[2].y * grad_coup[2].y;
     assert(d_ii_isolated_sq == 0.0f);
 
     std::cout << "[Pass] Advection and gradient coupling vectors computed "
                  "correctly.\n";
+    sim.cleanup();
+}
+
+// Pressure Solver Initialization Test
+void testInitPressureSolver() {
+    std::cout << "\n[TEST] Running testInitPressureSolver...\n";
+
+    FluidSimulation sim;
+    sim.initialize("config/test_config.json");
+
+    std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
+                                    make_float2(0.55f, 0.55f),
+                                    make_float2(1.8f, 1.8f)};
+
+    sim.uploadTestParticles(test_pos);
+
+    // sim.update() runs spatial hashing, density,
+    // advection/gradient, and initPressureSolverKernel
+    float dt = 0.01f;
+    sim.update(dt);
+
+    std::vector<float2> grad_coup = sim.copyGradCoupToHost();
+
+    // Retrieve resulting buffers from device
+    std::vector<float> density_adv = sim.copyDensityAdvToHost();
+    std::vector<float> diag_coeff = sim.copyDiagCoeffToHost();
+    std::vector<float> pressure = sim.copyPressureToHost();
+
+    // Assertions
+    assert(density_adv.size() >= 3);
+    assert(diag_coeff.size() >= 3);
+    assert(pressure.size() >= 3);
+
+    // Interacting particle 0 should have a valid computed diagonal coefficient
+    // (a_ii > 0)
+    assert(diag_coeff[0] > 0.0f);
+    // Isolated particle 2 should have zero diagonal coefficient accumulation
+    assert(diag_coeff[2] == 0.0f);
+
+    // Verify advective density computed valid values
+    assert(density_adv[0] > 0.0f);
+
+    std::cout << "[Pass] Pressure solver initialization kernel executed and "
+                 "validated successfully via update().\n";
     sim.cleanup();
 }
 
@@ -145,6 +185,7 @@ int main() {
         testSpatialHashingAndSort();
         testDensityKernel();
         testAdvectionAndGradient();
+        testInitPressureSolver();
         std::cout << "\n=== ALL TESTS PASSED SUCCESSFULLY ===\n";
     } catch (const std::exception& e) {
         std::cerr << "[TEST ERROR] Exception caught: " << e.what() << "\n";

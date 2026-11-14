@@ -29,10 +29,12 @@ private:
     float2* d_pos = nullptr;
     float2* d_vel = nullptr;
     float2* d_vel_adv = nullptr;
-    float2* d_grad_coup_vect = nullptr;
     float* d_density = nullptr;
-    float* d_predicted_density = nullptr;
+    float* d_density_adv = nullptr;
     float* d_pressure = nullptr;
+    float* d_pressure_prev = nullptr;
+    float2* d_grad_coup_vect = nullptr; // d_ii
+    float* d_diag_coeff = nullptr;      // a_ii
 
     // Spatial Hashing & CUB Sort Buffers
     unsigned int* d_keys_in = nullptr;
@@ -66,7 +68,7 @@ public:
 
     bool arePointersAllocated() const {
         return d_pos != nullptr && d_vel != nullptr && d_density != nullptr &&
-               d_predicted_density != nullptr && d_pressure != nullptr &&
+               d_density_adv != nullptr && d_pressure != nullptr &&
                d_keys_in != nullptr && d_keys_out != nullptr &&
                pointers_allocated;
     }
@@ -77,4 +79,7 @@ public:
     std::vector<float> copyDensitiesToHost();
     std::vector<float2> copyVelAdvToHost() const;
     std::vector<float2> copyGradCoupToHost() const;
+    std::vector<float> copyDensityAdvToHost() const;
+    std::vector<float> copyDiagCoeffToHost() const;
+    std::vector<float> copyPressureToHost() const;
 };
