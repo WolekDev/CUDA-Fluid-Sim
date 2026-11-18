@@ -70,8 +70,9 @@ void testDensityKernel() {
     FluidSimulation sim;
     sim.initialize("config/test_config.json");
 
+    // Close particles that will interact within smoothing radius (0.04)
     std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
-                                    make_float2(0.55f, 0.55f),
+                                    make_float2(0.52f, 0.5f),
                                     make_float2(1.8f, 1.8f)};
 
     sim.uploadTestParticles(test_pos);
@@ -94,16 +95,17 @@ void testAdvectionAndGradient() {
     FluidSimulation sim;
     sim.initialize("config/test_config.json");
 
-    // Two close particles that will interact within smoothing radius
+    // Two close particles that will interact within smoothing radius (0.04)
     std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
-                                    make_float2(0.55f, 0.55f),
+                                    make_float2(0.52f, 0.5f),
                                     make_float2(1.8f, 1.8f)};
 
     sim.uploadTestParticles(test_pos);
 
     float dt = 0.01f;
-    sim.update(dt); // Will now trigger hash, sort, cell ranges, density, and
-                    // advection/gradient kernels
+    // Will now trigger hash, sort, cell ranges, density, and advection/gradient
+    // kernels
+    sim.update(dt);
 
     std::vector<float2> vel_adv = sim.copyVelAdvToHost();
     std::vector<float2> grad_coup = sim.copyGradCoupToHost();
@@ -118,8 +120,7 @@ void testAdvectionAndGradient() {
     std::cout << "[Pass] Particle 0 advective velocity y = " << vel_adv[0].y
               << "\n";
 
-    // Verify gradient coupling vector d_ii accumulates neighbor
-    // contributions
+    // Verify gradient coupling vector d_ii accumulates neighbor contributions
     float d_ii_mag_sq =
         grad_coup[0].x * grad_coup[0].x + grad_coup[0].y * grad_coup[0].y;
     assert(d_ii_mag_sq > 0.0f);
@@ -141,8 +142,9 @@ void testInitPressureSolver() {
     FluidSimulation sim;
     sim.initialize("config/test_config.json");
 
+    // Close particles that will interact within smoothing radius (0.04)
     std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
-                                    make_float2(0.55f, 0.55f),
+                                    make_float2(0.52f, 0.5f),
                                     make_float2(1.8f, 1.8f)};
 
     sim.uploadTestParticles(test_pos);
@@ -178,6 +180,77 @@ void testInitPressureSolver() {
     sim.cleanup();
 }
 
+// Pressure and Density Solver Kernel Test
+void testPressureAndDensitySolver() {
+    std::cout << "\n[TEST] Running testPressureAndDensitySolver...\n";
+
+    FluidSimulation sim;
+    sim.initialize("config/test_config.json");
+
+    // Close particles that will interact and trigger pressure solvers
+    std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
+                                    make_float2(0.52f, 0.5f),
+                                    make_float2(1.8f, 1.8f)};
+
+    sim.uploadTestParticles(test_pos);
+
+    float dt = 0.01f;
+    // Running update executes the full pipeline including the while loop,
+    // updatePressureKernel, updateDensityKernel, and CUB reduction.
+    sim.update(dt);
+
+    std::vector<float> pressure = sim.copyPressureToHost();
+    std::vector<float> pred_densities = sim.copyPredictedDensitiesToHost();
+
+    assert(pressure.size() >= 3);
+    assert(pred_densities.size() >= 3);
+
+    // Verify pressures are non-negative due to clamping (`fmaxf(0.0f, ...)`)
+    for (float p : pressure) {
+        assert(p >= 0.0f);
+    }
+
+    // Verify predicted densities were populated with valid values
+    assert(pred_densities[0] > 0.0f);
+    assert(pred_densities[1] > 0.0f);
+
+    std::cout
+        << "[Pass] Pressure and density solver kernels executed successfully, "
+           "pressures are properly clamped, and predicted densities are "
+           "valid.\n";
+    sim.cleanup();
+}
+
+// Previous Pressure Backup Test
+void testPreviousPressureCopy() {
+    std::cout << "\n[TEST] Running testPreviousPressureCopy...\n";
+
+    FluidSimulation sim;
+    sim.initialize("config/test_config.json");
+
+    // Close particles for backup verification
+    std::vector<float2> test_pos = {make_float2(0.5f, 0.5f),
+                                    make_float2(0.52f, 0.5f)};
+    sim.uploadTestParticles(test_pos);
+
+    sim.update(0.01f);
+
+    std::vector<float> current_pressure = sim.copyPressureToHost();
+    std::vector<float> prev_pressure = sim.copyPrevPressureToHost();
+
+    assert(current_pressure.size() == prev_pressure.size());
+
+    // At the end of update(), d_pressure is copied to d_pressure_prev via
+    // cudaMemcpy
+    for (size_t i = 0; i < current_pressure.size(); ++i) {
+        assert(current_pressure[i] == prev_pressure[i]);
+    }
+
+    std::cout << "[Pass] d_pressure successfully copied to d_pressure_prev at "
+                 "frame end.\n";
+    sim.cleanup();
+}
+
 int main() {
     std::cout << "=== STARTING FLUID SIMULATION TEST SUITE ===\n";
     try {
@@ -186,6 +259,8 @@ int main() {
         testDensityKernel();
         testAdvectionAndGradient();
         testInitPressureSolver();
+        testPressureAndDensitySolver();
+        testPreviousPressureCopy();
         std::cout << "\n=== ALL TESTS PASSED SUCCESSFULLY ===\n";
     } catch (const std::exception& e) {
         std::cerr << "[TEST ERROR] Exception caught: " << e.what() << "\n";

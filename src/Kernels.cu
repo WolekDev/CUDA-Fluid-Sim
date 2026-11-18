@@ -413,3 +413,312 @@ __global__ void initPressureSolverKernel(
     d_density_adv[p_idx] = density_adv_sum * delta_time + d_density[p_idx];
     d_diag_coeff[p_idx] = a_ii_sum;
 }
+
+/* This is the kernel for solving SUM(dij * Pj^l). This equation refers to the
+ * total movement based on pressure forces for each particle. This is needed for
+ * the main pressure solver kernel.
+ * Equation: SUM(d_ji * P_j^l) = dt^2 * SUM_j( p_j * (-mj / (rho_j(t)^2) ) dot
+ * Wij)*/
+__global__ void calculateSumMovementFromPressureKernel(
+    const float2* __restrict__ d_pos, const float* __restrict__ d_density,
+    const float* __restrict__ d_pressure,
+    const unsigned int* __restrict__ d_sorted_values,
+    const unsigned int* __restrict__ d_cell_start_indices,
+    const unsigned int* __restrict__ d_cell_end_indices,
+    float2* __restrict__ d_sum_movement_pressure, int num_particles,
+    SimulationParams params, float delta_time) {
+
+    // Get particle's unique index
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles)
+        return;
+
+    // Extract particle's position
+    const float2 pos = d_pos[idx];
+
+    // Get cell coordinates for particle
+    const int cx = static_cast<int>(
+        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
+    const int cy = static_cast<int>(
+        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
+
+    // Variables for calculation
+    const float mass = params.particle_mass;
+    const float h = params.smoothing_radius;
+    const float h2 = h * h;
+    float2 sum = make_float2(0.0f, 0.0f);
+
+    // Loop through neighboring cells on x-axis
+    for (int i = cx - 1; i <= cx + 1; i++) {
+        // Ensure x bounds
+        if (i < 0 || i >= params.grid_width)
+            continue;
+
+        // Loop through neighboring cells on y-axis
+        for (int j = cy - 1; j <= cy + 1; j++) {
+            // Ensure y bounds
+            if (j < 0 || j >= params.grid_height)
+                continue;
+
+            // Get hash key for the target cell
+            const unsigned int hi = static_cast<unsigned int>(i);
+            const unsigned int hj = static_cast<unsigned int>(j);
+            const unsigned int key = hj * params.grid_width + hi;
+
+            // Get start and end index for particles in this cell
+            const unsigned int start_index = d_cell_start_indices[key];
+            const unsigned int end_index = d_cell_end_indices[key];
+
+            // Ensure that the start index is before the end and that the
+            // indexes are not default value (unmodified)
+            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
+                end_index == 0xFFFFFFFFu)
+                continue;
+
+            // Loop through all particles in cell range
+            for (unsigned int k = start_index; k < end_index; ++k) {
+                // Get neighbor particle index and position
+                const unsigned int neighbor_idx = d_sorted_values[k];
+                const float2 neighbor_pos = d_pos[neighbor_idx];
+
+                // Calculate distance to main particle
+                const float2 r_ij =
+                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
+                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+
+                /* Check if neighbor is in range of particle based on smoothing
+                   radius. */
+                // h = smoothing radius,
+                // r = distance between particle and neighbor,
+                if (r2 > 0.0f && r2 <= h2) {
+                    const float density_j = d_density[neighbor_idx];
+                    const float pressure_j = d_pressure[neighbor_idx];
+
+                    // Coefficient including mass, density, and neighbor
+                    // pressure
+                    const float coeff =
+                        pressure_j * (mass / (density_j * density_j));
+
+                    const float r = sqrtf(r2);
+                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+
+                    // Accumulate term: sum(d_ij * P_j) where d_ij contains the
+                    // gradient factor
+                    sum.x += coeff * grad_w_ij.x;
+                    sum.y += coeff * grad_w_ij.y;
+                }
+            }
+        }
+    }
+
+    // Finalize calculation and set value in buffer.
+    d_sum_movement_pressure[idx].x = delta_time * delta_time * sum.x;
+    d_sum_movement_pressure[idx].y = delta_time * delta_time * sum.y;
+}
+
+/* Main pressure solver kernel. Computes p_i^(l+1) for the next iteration of the
+ * loop.
+ *
+ * Equation Pressure: p_i^(l+1) = (1-omega)*p_i^l + (omega/a_ii) * (rest_density
+ * - rho_i^adv - SUM_j(mass_j * (SUM_j(d_ij * p_j^l) - d_jj*p_j -
+ * SUM_k!=i(d_jk*p_k^l))) dot W_ij) */
+__global__ void updatePressureKernel(
+    const float2* __restrict__ d_pos, const float* __restrict__ d_density_adv,
+    const float* __restrict__ d_diag_coeff, float* __restrict__ d_pressure,
+    const unsigned int* __restrict__ d_sorted_values,
+    const unsigned int* __restrict__ d_cell_start_indices,
+    const unsigned int* __restrict__ d_cell_end_indices,
+    const float2* __restrict__ d_sum_movement_pressure,
+    const float2* __restrict__ d_grad_coup_vect, int num_particles,
+    SimulationParams params) {
+
+    // Get particle index
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles)
+        return;
+
+    // Get particle position and cell coordinates
+    const float2 pos = d_pos[idx];
+    const int cx = static_cast<int>(
+        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
+    const int cy = static_cast<int>(
+        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
+
+    // Variables for calculations
+    const float mass = params.particle_mass;
+    const float h = params.smoothing_radius;
+    const float h2 = h * h;
+    const float rho_0 = params.rest_density;
+    const float omega = params.relaxation_factor;
+
+    // Precalculated variables
+    const float rho_i_adv = d_density_adv[idx];
+    const float p_i_l = d_pressure[idx];
+    const float a_ii = d_diag_coeff[idx];
+    const float2 sum_dij_pj = d_sum_movement_pressure[idx];
+    const float2 d_ji_self = d_grad_coup_vect[idx];
+
+    float neighbor_sum = 0.0f;
+
+    // Neighbor search grid traversal
+    for (int i = cx - 1; i <= cx + 1; i++) {
+        if (i < 0 || i >= params.grid_width)
+            continue;
+        for (int j = cy - 1; j <= cy + 1; j++) {
+            if (j < 0 || j >= params.grid_height)
+                continue;
+
+            // Look up cell start and end range
+            const unsigned int key = j * params.grid_width + i;
+            const unsigned int start_index = d_cell_start_indices[key];
+            const unsigned int end_index = d_cell_end_indices[key];
+
+            // Check that cell indexes are valid and initialized
+            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
+                end_index == 0xFFFFFFFFu)
+                continue;
+
+            // Loop through all particles in cell
+            for (unsigned int k = start_index; k < end_index; ++k) {
+                const unsigned int neighbor_idx = d_sorted_values[k];
+                if (neighbor_idx == idx)
+                    continue;
+
+                const float2 neighbor_pos = d_pos[neighbor_idx];
+                const float2 r_ij =
+                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
+                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+
+                // ensure neighbor is in range of main particle
+                if (r2 > 0.0f && r2 <= h2) {
+                    const float r = sqrtf(r2);
+                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+
+                    const float2 sum_djk_pk_j =
+                        d_sum_movement_pressure[neighbor_idx];
+                    const float2 d_jj = d_grad_coup_vect[neighbor_idx];
+                    const float p_j = d_pressure[neighbor_idx];
+
+                    // Evaluate inner bracket term
+                    float2 inner_bracket =
+                        make_float2(sum_dij_pj.x - (d_jj.x * p_j) -
+                                        (sum_djk_pk_j.x - d_ji_self.x * p_i_l),
+                                    sum_dij_pj.y - (d_jj.y * p_j) -
+                                        (sum_djk_pk_j.y - d_ji_self.y * p_i_l));
+
+                    neighbor_sum += mass * (inner_bracket.x * grad_w_ij.x +
+                                            inner_bracket.y * grad_w_ij.y);
+                }
+            }
+        }
+    }
+
+    // Update & clamp pressure
+    float updated_pressure = p_i_l;
+    if (a_ii > 1e-12f) {
+        updated_pressure = (1.0f - omega) * p_i_l +
+                           (omega / a_ii) * (rho_0 - rho_i_adv - neighbor_sum);
+        updated_pressure = fmaxf(0.0f, updated_pressure);
+    }
+    d_pressure[idx] = updated_pressure;
+}
+
+/* Computes rho_i^l for the next iteration of the loop.
+ *
+ * Equation Density: rho_i^l = rho_i^adv + a_ii * p_i^l + SUM_j(d_ij * p_j^l) */
+__global__ void
+updateDensityKernel(const float2* __restrict__ d_pos,
+                    const float* __restrict__ d_density_adv,
+                    const float* __restrict__ d_diag_coeff,
+                    const float* __restrict__ d_pressure,
+                    float* __restrict__ d_density_predicted,
+                    const unsigned int* __restrict__ d_sorted_values,
+                    const unsigned int* __restrict__ d_cell_start_indices,
+                    const unsigned int* __restrict__ d_cell_end_indices,
+                    const float2* __restrict__ d_sum_movement_pressure,
+                    const float2* __restrict__ d_grad_coup_vect,
+                    int num_particles, SimulationParams params) {
+
+    // Get particle index
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles)
+        return;
+
+    // Get particle position and cell coordinates
+    const float2 pos = d_pos[idx];
+    const int cx = static_cast<int>(
+        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
+    const int cy = static_cast<int>(
+        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
+
+    // Variables for calculations
+    const float mass = params.particle_mass;
+    const float h = params.smoothing_radius;
+    const float h2 = h * h;
+
+    // Precalculated variables
+    const float rho_i_adv = d_density_adv[idx];
+    const float p_i_updated =
+        d_pressure[idx]; // Uses the freshly updated pressure p^(l+1)
+    const float a_ii = d_diag_coeff[idx];
+    const float2 sum_dij_pj = d_sum_movement_pressure[idx];
+    const float2 d_ji_self = d_grad_coup_vect[idx];
+
+    float neighbor_sum = 0.0f;
+
+    // Neighbor search grid traversal
+    for (int i = cx - 1; i <= cx + 1; i++) {
+        if (i < 0 || i >= params.grid_width)
+            continue;
+        for (int j = cy - 1; j <= cy + 1; j++) {
+            if (j < 0 || j >= params.grid_height)
+                continue;
+
+            // Look up cell start and end range
+            const unsigned int key = j * params.grid_width + i;
+            const unsigned int start_index = d_cell_start_indices[key];
+            const unsigned int end_index = d_cell_end_indices[key];
+
+            // Check that cell indexes are valid and initialized
+            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
+                end_index == 0xFFFFFFFFu)
+                continue;
+
+            // Loop through all particles in cell
+            for (unsigned int k = start_index; k < end_index; ++k) {
+                const unsigned int neighbor_idx = d_sorted_values[k];
+                if (neighbor_idx == idx)
+                    continue;
+
+                const float2 neighbor_pos = d_pos[neighbor_idx];
+                const float2 r_ij =
+                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
+                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+
+                // ensure neighbor is in range of main particle
+                if (r2 > 0.0f && r2 <= h2) {
+                    const float r = sqrtf(r2);
+                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+
+                    const float2 sum_djk_pk_j =
+                        d_sum_movement_pressure[neighbor_idx];
+                    const float2 d_jj = d_grad_coup_vect[neighbor_idx];
+                    const float p_j = d_pressure[neighbor_idx];
+
+                    float2 inner_bracket = make_float2(
+                        sum_dij_pj.x - (d_jj.x * p_j) -
+                            (sum_djk_pk_j.x - d_ji_self.x * p_i_updated),
+                        sum_dij_pj.y - (d_jj.y * p_j) -
+                            (sum_djk_pk_j.y - d_ji_self.y * p_i_updated));
+
+                    neighbor_sum += mass * (inner_bracket.x * grad_w_ij.x +
+                                            inner_bracket.y * grad_w_ij.y);
+                }
+            }
+        }
+    }
+
+    // Predicted density for convergence check: rho^(l+1) = rho_adv + a_ii *
+    // p_updated + neighbor_sum
+    d_density_predicted[idx] = rho_i_adv + (a_ii * p_i_updated) + neighbor_sum;
+}

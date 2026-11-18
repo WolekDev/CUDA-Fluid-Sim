@@ -31,10 +31,18 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/glad/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/nlohmann/include)
 include_directories(${CUDAToolkit_INCLUDE_DIRS})
 
-# Automatically copy the config directory to the build output folder
-file(COPY ${CMAKE_CURRENT_SOURCE_DIR}/config DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+# -----------------------------------------------------------------------------
+# Configuration Sync Setup
+# -----------------------------------------------------------------------------
+# Automatically copy the config directory to the build output folder on every build
+add_custom_target(CopyConfigs ALL
+    COMMAND ${CMAKE_COMMAND} -E copy_directory
+    ${CMAKE_CURRENT_SOURCE_DIR}/config
+    ${CMAKE_CURRENT_BINARY_DIR}/config
+    COMMENT "Copying latest configuration files to build directory..."
+)
 
-# 1. Define the main application target (pure production code)
+# Define the main application target
 add_executable(FluidSim 
     src/main.cpp
     src/FluidSimulation.cu
@@ -49,7 +57,7 @@ target_link_libraries(FluidSim PRIVATE
     CUDA::cuda_driver
 )
 
-# 2. Define the isolated test executable target in the tests/ directory
+# Define the test executable target in the tests/ directory
 add_executable(FluidSimTest
     tests/tests.cu
     src/FluidSimulation.cu
@@ -61,10 +69,11 @@ target_link_libraries(FluidSimTest PRIVATE
     CUDA::cuda_driver
 )
 
-# Automatically copy the config folder to the build directory next to the executable
-file(COPY ${CMAKE_SOURCE_DIR}/config DESTINATION ${CMAKE_CURRENT_BINARY_DIR})
+# Force both targets to depend on CopyConfigs so they are always synchronized
+add_dependencies(FluidSim CopyConfigs)
+add_dependencies(FluidSimTest CopyConfigs)
 
-# 3. Enable CTest and register the test binary
+# Enable CTest and register the test binary
 enable_testing()
 add_test(NAME PipelineTestSuite COMMAND FluidSimTest)
 

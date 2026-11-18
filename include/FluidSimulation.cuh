@@ -31,10 +31,12 @@ private:
     float2* d_vel_adv = nullptr;
     float* d_density = nullptr;
     float* d_density_adv = nullptr;
+    float* d_density_predicted = nullptr;
     float* d_pressure = nullptr;
     float* d_pressure_prev = nullptr;
-    float2* d_grad_coup_vect = nullptr; // d_ii
-    float* d_diag_coeff = nullptr;      // a_ii
+    float2* d_grad_coup_vect = nullptr;        // d_ii
+    float* d_diag_coeff = nullptr;             // a_ii
+    float2* d_sum_movement_pressure = nullptr; // SUM_j(d_ij * p_j^l)
 
     // Spatial Hashing & CUB Sort Buffers
     unsigned int* d_keys_in = nullptr;
@@ -43,10 +45,13 @@ private:
     unsigned int* d_values_out = nullptr;
     unsigned int* d_cell_start_indices = nullptr;
     unsigned int* d_cell_end_indices = nullptr;
+    float* d_density_sum_output = nullptr;
 
     // CUB Temporary Storage Workspaces
     void* d_cub_temp_storage = nullptr;
+    void* d_cub_reduction_storage = nullptr;
     size_t h_cub_temp_storage_bytes = 0;
+    size_t h_cub_reduction_storage_bytes = 0;
 
     bool pointers_allocated = false;
 
@@ -82,4 +87,6 @@ public:
     std::vector<float> copyDensityAdvToHost() const;
     std::vector<float> copyDiagCoeffToHost() const;
     std::vector<float> copyPressureToHost() const;
+    std::vector<float> copyPredictedDensitiesToHost() const;
+    std::vector<float> copyPrevPressureToHost() const;
 };

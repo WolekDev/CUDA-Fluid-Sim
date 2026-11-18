@@ -17,10 +17,26 @@ void FluidSimulation::initialize(const std::string& config_file) {
     // Open config file and create JSON object
     std::ifstream conf(config_file);
     if (!conf.is_open()) {
-        throw std::runtime_error("Failed to open configuration file: " +
+        throw std::runtime_error("Failed to open configuration file at path: " +
                                  config_file);
     }
-    json data = json::parse(conf);
+
+    // Ensure config file is not empty
+    conf.seekg(0, std::ios::end);
+    std::streamsize len = conf.tellg();
+    conf.seekg(0, std::ios::beg);
+    if (len == 0) {
+        throw std::runtime_error("Config file is empty (0 bytes): " +
+                                 config_file);
+    }
+
+    json data;
+    try {
+        conf >> data;
+    } catch (const json::parse_error& e) {
+        throw std::runtime_error("JSON parse error in " + config_file + ": " +
+                                 std::string(e.what()));
+    }
 
     // Parse config & simulation parameters
     h_max_iterations = data["solver"]["max_iterations"];
@@ -37,6 +53,7 @@ void FluidSimulation::initialize(const std::string& config_file) {
     h_params.time_step = data["simulation"]["time_step"];
     h_params.particle_mass = data["fluid"]["particle_mass"];
     h_params.viscosity = data["fluid"]["viscosity"];
+    h_params.relaxation_factor = data["fluid"]["relaxation_factor"];
 
     // Parse domain boundaries & store in h_params for kernel access
     h_params.domain_min_x = data["domain"]["min_x"];
@@ -60,9 +77,10 @@ void FluidSimulation::initialize(const std::string& config_file) {
     // Position
     cudaMalloc(&d_pos, h_max_particles * sizeof(float2));
 
-    // Density & Density Adv
+    // Density & Density Adv & Density Predicted
     cudaMalloc(&d_density, h_max_particles * sizeof(float));
     cudaMalloc(&d_density_adv, h_max_particles * sizeof(float));
+    cudaMalloc(&d_density_predicted, h_max_particles * sizeof(float));
 
     // Pressure & Previous Pressure
     cudaMalloc(&d_pressure, h_max_particles * sizeof(float));
@@ -79,6 +97,9 @@ void FluidSimulation::initialize(const std::string& config_file) {
     // Diagonal Coefficient for Pressure Matrix (aii)
     cudaMalloc(&d_diag_coeff, h_max_particles * sizeof(float));
 
+    // SUM_j(d_ij * p_j^l) buffer
+    cudaMalloc(&d_sum_movement_pressure, h_max_particles * sizeof(float2));
+
     // Allocate hash key & value arrays
     cudaMalloc(&d_keys_in,
                h_max_particles * sizeof(unsigned int)); // Keys before sorting
@@ -93,11 +114,19 @@ void FluidSimulation::initialize(const std::string& config_file) {
     cudaMalloc(&d_cell_start_indices, h_max_grid_cells * sizeof(unsigned int));
     cudaMalloc(&d_cell_end_indices, h_max_grid_cells * sizeof(unsigned int));
 
-    // Pre-allocate CUB Radix sort temp storage
+    // Pre-allocate CUB Radix sort temp storage based on max particles
     cub::DeviceRadixSort::SortPairs(nullptr, h_cub_temp_storage_bytes,
                                     d_keys_in, d_keys_out, d_values_in,
                                     d_values_out, h_max_particles);
     cudaMalloc(&d_cub_temp_storage, h_cub_temp_storage_bytes);
+
+    // Pre-allocate CUB Reduction temp storage and output scalar buffer for
+    // convergence check
+    cub::DeviceReduce::Sum(nullptr, h_cub_reduction_storage_bytes,
+                           d_density_predicted, d_density_sum_output,
+                           h_max_particles);
+    cudaMalloc(&d_cub_reduction_storage, h_cub_reduction_storage_bytes);
+    cudaMalloc(&d_density_sum_output, sizeof(float));
 
     // Set flag that all pointers are allocated
     pointers_allocated = true;
@@ -134,10 +163,50 @@ void FluidSimulation::update(float delta_time) {
         d_values_out, d_cell_start_indices, d_cell_end_indices, d_pressure,
         d_pressure_prev, d_diag_coeff, current_particles, h_params, delta_time);
 
-    // Future note, after all main logic, calculate d_pressure_prev for next
-    // iteration.
+    // Pressure loop
+    int l = 0;
+    float density_avg_l = 0.0f;
 
-    // Check if an error occured while launching the kernel
+    while ((density_avg_l - h_params.rest_density > h_density_error_threshold ||
+            l < 2) &&
+           l < h_max_iterations) {
+        // Calculate SUM_j(d_ij * p_j^l)
+        calculateSumMovementFromPressureKernel<<<gridSize, kBlockSize>>>(
+            d_pos, d_density, d_pressure, d_values_out, d_cell_start_indices,
+            d_cell_end_indices, d_sum_movement_pressure, current_particles,
+            h_params, delta_time);
+
+        // Update pressure
+        updatePressureKernel<<<gridSize, kBlockSize>>>(
+            d_pos, d_density_adv, d_diag_coeff, d_pressure, d_values_out,
+            d_cell_start_indices, d_cell_end_indices, d_sum_movement_pressure,
+            d_grad_coup_vect, current_particles, h_params);
+
+        // Update density
+        updateDensityKernel<<<gridSize, kBlockSize>>>(
+            d_pos, d_density_adv, d_diag_coeff, d_pressure, d_density_predicted,
+            d_values_out, d_cell_start_indices, d_cell_end_indices,
+            d_sum_movement_pressure, d_grad_coup_vect, current_particles,
+            h_params);
+
+        // Compute average predicted density via CUB parallel reduction
+        cub::DeviceReduce::Sum(
+            d_cub_reduction_storage, h_cub_reduction_storage_bytes,
+            d_density_predicted, d_density_sum_output, current_particles);
+
+        float h_density_sum = 0.0f;
+        cudaMemcpy(&h_density_sum, d_density_sum_output, sizeof(float),
+                   cudaMemcpyDeviceToHost);
+        density_avg_l = h_density_sum / static_cast<float>(current_particles);
+
+        l++;
+    }
+
+    // Save current pressure as previous pressure for the next frame
+    cudaMemcpy(d_pressure_prev, d_pressure, h_max_particles * sizeof(float),
+               cudaMemcpyDeviceToDevice);
+
+    // Check if an error occurred while launching the kernel
     cudaError_t err = cudaGetLastError();
     if (err != cudaSuccess) {
         std::cerr << "CUDA kernel launch error: " << cudaGetErrorString(err)
@@ -187,9 +256,15 @@ void FluidSimulation::cleanup() {
 
     cudaFree(d_pos);
     cudaFree(d_vel);
+    cudaFree(d_vel_adv);
     cudaFree(d_density);
     cudaFree(d_density_adv);
+    cudaFree(d_density_predicted);
     cudaFree(d_pressure);
+    cudaFree(d_pressure_prev);
+    cudaFree(d_grad_coup_vect);
+    cudaFree(d_diag_coeff);
+    cudaFree(d_sum_movement_pressure);
     cudaFree(d_keys_in);
     cudaFree(d_keys_out);
     cudaFree(d_values_in);
@@ -197,15 +272,19 @@ void FluidSimulation::cleanup() {
     cudaFree(d_cell_start_indices);
     cudaFree(d_cell_end_indices);
     cudaFree(d_cub_temp_storage);
-    cudaFree(d_vel_adv);
-    cudaFree(d_grad_coup_vect);
+    cudaFree(d_cub_reduction_storage);
+    cudaFree(d_density_sum_output);
 
+    // Nullify all pointers
     d_pos = d_vel = d_vel_adv = d_grad_coup_vect = nullptr;
-    d_density = d_density_adv = d_pressure = nullptr;
-    d_keys_in = d_keys_out = nullptr;
-    d_values_in = d_values_out = nullptr;
+    d_density = d_density_adv = d_density_predicted = nullptr;
+    d_pressure = d_pressure_prev = d_diag_coeff = nullptr;
+    d_sum_movement_pressure = nullptr;
+    d_keys_in = d_keys_out = d_values_in = d_values_out = nullptr;
     d_cell_start_indices = d_cell_end_indices = nullptr;
-    d_cub_temp_storage = nullptr;
+    d_cub_temp_storage = d_cub_reduction_storage = nullptr;
+    d_density_sum_output = nullptr;
+
     pointers_allocated = false;
 }
 
@@ -215,6 +294,9 @@ void FluidSimulation::uploadTestParticles(const std::vector<float2>& pts) {
         throw std::runtime_error(
             "Test particle count exceeds max_particles defined in config.");
     }
+
+    // Set active particle count to match the test batch size
+    h_active_particle_count = static_cast<int>(pts.size());
 
     cudaError_t err = cudaMemcpy(d_pos, pts.data(), pts.size() * sizeof(float2),
                                  cudaMemcpyHostToDevice);
@@ -306,4 +388,26 @@ std::vector<float> FluidSimulation::copyPressureToHost() const {
                    current_particles * sizeof(float), cudaMemcpyDeviceToHost);
     }
     return h_pressure;
+}
+
+/* Debug function: Copies the predicted density buffer from device to host. */
+std::vector<float> FluidSimulation::copyPredictedDensitiesToHost() const {
+    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    std::vector<float> h_pred_densities(current_particles);
+    if (current_particles > 0 && d_density_predicted) {
+        cudaMemcpy(h_pred_densities.data(), d_density_predicted,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return h_pred_densities;
+}
+
+/* Debug function: Copies the previous pressure buffer from device to host. */
+std::vector<float> FluidSimulation::copyPrevPressureToHost() const {
+    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    std::vector<float> h_prev_pressure(current_particles);
+    if (current_particles > 0 && d_pressure_prev) {
+        cudaMemcpy(h_prev_pressure.data(), d_pressure_prev,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToHost);
+    }
+    return h_prev_pressure;
 }

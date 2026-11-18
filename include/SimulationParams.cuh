@@ -3,7 +3,7 @@
 
 #include <cuda_runtime.h>
 
-/* A struct to combine several useful paramaters together for use in kernels. */
+/* A struct to combine several useful parameters together for use in kernels. */
 struct SimulationParams {
     // Physics & Simulation Constants
     float2 gravity_vector;
@@ -12,6 +12,7 @@ struct SimulationParams {
     float time_step;
     float particle_mass;
     float viscosity;
+    float relaxation_factor;
 
     // Spatial Domain & Grid Parameters for GPU Hashing
     float domain_min_x;
