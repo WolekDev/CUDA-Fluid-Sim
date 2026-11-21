@@ -12,11 +12,12 @@ private:
     int h_max_iterations = 0;
     float h_density_error_threshold = 0.0f;
     int h_active_particle_count = 0;
-    float2 h_start_vel = make_float2(0.0f, 0.0f);
+    float3 h_start_vel = make_float3(0.0f, 0.0f, 0.0f);
 
     // Grid sizing metadata calculated on host during initialization
     int h_grid_width = 0;
     int h_grid_height = 0;
+    int h_grid_depth = 0;
     int h_max_grid_cells = 0;
 
     // Hard coded value for block size
@@ -26,17 +27,19 @@ private:
     SimulationParams h_params;
 
     // Device Pointers
-    float2* d_pos = nullptr;
-    float2* d_vel = nullptr;
-    float2* d_vel_adv = nullptr;
+    float3* d_pos = nullptr;
+    float3* d_pos_next = nullptr;
+    float3* d_vel = nullptr;
+    float3* d_vel_adv = nullptr;
     float* d_density = nullptr;
     float* d_density_adv = nullptr;
     float* d_density_predicted = nullptr;
     float* d_pressure = nullptr;
     float* d_pressure_prev = nullptr;
-    float2* d_grad_coup_vect = nullptr;        // d_ii
+    float* d_pressure_next = nullptr;
+    float3* d_grad_coup_vect = nullptr;        // d_ii
     float* d_diag_coeff = nullptr;             // a_ii
-    float2* d_sum_movement_pressure = nullptr; // SUM_j(d_ij * p_j^l)
+    float3* d_sum_movement_pressure = nullptr; // SUM_j(d_ij * p_j^l)
 
     // Spatial Hashing & CUB Sort Buffers
     unsigned int* d_keys_in = nullptr;
@@ -79,11 +82,14 @@ public:
     }
 
     // Test Helper Methods
-    void uploadTestParticles(const std::vector<float2>& pts);
+    void uploadTestParticles(const std::vector<float3>& pts);
+    void uploadTestVelocities(const std::vector<float3>& velocities);
     std::vector<unsigned int> copyKeysToHost();
     std::vector<float> copyDensitiesToHost();
-    std::vector<float2> copyVelAdvToHost() const;
-    std::vector<float2> copyGradCoupToHost() const;
+    std::vector<float3> copyPositionsToHost() const;
+    std::vector<float3> copyVelocitiesToHost() const;
+    std::vector<float3> copyVelAdvToHost() const;
+    std::vector<float3> copyGradCoupToHost() const;
     std::vector<float> copyDensityAdvToHost() const;
     std::vector<float> copyDiagCoeffToHost() const;
     std::vector<float> copyPressureToHost() const;

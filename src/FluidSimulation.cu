@@ -43,11 +43,12 @@ void FluidSimulation::initialize(const std::string& config_file) {
     h_density_error_threshold = data["solver"]["density_error_threshold"];
     h_max_particles = data["simulation"]["max_particles"];
     h_active_particle_count = h_max_particles; // Swap to 0 for dynamic spawning
-    h_start_vel = make_float2(data["fluid"]["start_vel"][0],
-                              data["fluid"]["start_vel"][1]);
+    h_start_vel = make_float3(data["fluid"]["start_vel"][0],
+                              data["fluid"]["start_vel"][1],
+                              data["fluid"]["start_vel"][2]);
 
     auto grav = data["simulation"]["gravity"];
-    h_params.gravity_vector = make_float2(grav[0], grav[1]);
+    h_params.gravity_vector = make_float3(grav[0], grav[1], grav[2]);
     h_params.smoothing_radius = data["fluid"]["smoothing_radius"];
     h_params.rest_density = data["fluid"]["rest_density"];
     h_params.time_step = data["simulation"]["time_step"];
@@ -58,47 +59,66 @@ void FluidSimulation::initialize(const std::string& config_file) {
     // Parse domain boundaries & store in h_params for kernel access
     h_params.domain_min_x = data["domain"]["min_x"];
     h_params.domain_min_y = data["domain"]["min_y"];
+    h_params.domain_min_z = data["domain"]["min_z"];
     float domain_max_x = data["domain"]["max_x"];
     float domain_max_y = data["domain"]["max_y"];
+    float domain_max_z = data["domain"]["max_z"];
 
-    // Compute grid dimensions
+    // Compute grid dimensions. Cell size is the kernel support radius.
     float h = h_params.smoothing_radius;
     h_grid_width =
         static_cast<int>(ceilf((domain_max_x - h_params.domain_min_x) / h));
     h_grid_height =
         static_cast<int>(ceilf((domain_max_y - h_params.domain_min_y) / h));
-    h_max_grid_cells = h_grid_width * h_grid_height;
+    h_grid_depth =
+        static_cast<int>(ceilf((domain_max_z - h_params.domain_min_z) / h));
+    h_max_grid_cells = h_grid_width * h_grid_height * h_grid_depth;
 
     h_params.grid_width = h_grid_width;
     h_params.grid_height = h_grid_height;
+    h_params.grid_depth = h_grid_depth;
 
     // Allocate particle buffers
 
     // Position
-    cudaMalloc(&d_pos, h_max_particles * sizeof(float2));
+    cudaMalloc(&d_pos, h_max_particles * sizeof(float3));
+    cudaMalloc(&d_pos_next, h_max_particles * sizeof(float3));
+    cudaMemset(d_pos, 0, h_max_particles * sizeof(float3));
+    cudaMemset(d_pos_next, 0, h_max_particles * sizeof(float3));
 
     // Density & Density Adv & Density Predicted
     cudaMalloc(&d_density, h_max_particles * sizeof(float));
     cudaMalloc(&d_density_adv, h_max_particles * sizeof(float));
     cudaMalloc(&d_density_predicted, h_max_particles * sizeof(float));
+    cudaMemset(d_density, 0, h_max_particles * sizeof(float));
+    cudaMemset(d_density_adv, 0, h_max_particles * sizeof(float));
+    cudaMemset(d_density_predicted, 0, h_max_particles * sizeof(float));
 
-    // Pressure & Previous Pressure
+    // Pressure, previous pressure, and the Jacobi output for p^{l+1}
     cudaMalloc(&d_pressure, h_max_particles * sizeof(float));
     cudaMalloc(&d_pressure_prev, h_max_particles * sizeof(float));
-    cudaMemset(d_pressure_prev, 0.0f, h_max_particles * sizeof(float));
+    cudaMalloc(&d_pressure_next, h_max_particles * sizeof(float));
+    cudaMemset(d_pressure, 0, h_max_particles * sizeof(float));
+    cudaMemset(d_pressure_prev, 0, h_max_particles * sizeof(float));
+    cudaMemset(d_pressure_next, 0, h_max_particles * sizeof(float));
 
     // Velocity & Velocity Advection
-    cudaMalloc(&d_vel, h_max_particles * sizeof(float2));
-    cudaMalloc(&d_vel_adv, h_max_particles * sizeof(float2));
+    cudaMalloc(&d_vel, h_max_particles * sizeof(float3));
+    cudaMalloc(&d_vel_adv, h_max_particles * sizeof(float3));
+    cudaMemset(d_vel, 0, h_max_particles * sizeof(float3));
+    cudaMemset(d_vel_adv, 0, h_max_particles * sizeof(float3));
 
-    // Gradient Coupling Vector (dii)
-    cudaMalloc(&d_grad_coup_vect, h_max_particles * sizeof(float2));
+    // Displacement factor d_ii
+    cudaMalloc(&d_grad_coup_vect, h_max_particles * sizeof(float3));
+    cudaMemset(d_grad_coup_vect, 0, h_max_particles * sizeof(float3));
 
     // Diagonal Coefficient for Pressure Matrix (aii)
     cudaMalloc(&d_diag_coeff, h_max_particles * sizeof(float));
+    cudaMemset(d_diag_coeff, 0, h_max_particles * sizeof(float));
 
     // SUM_j(d_ij * p_j^l) buffer
-    cudaMalloc(&d_sum_movement_pressure, h_max_particles * sizeof(float2));
+    cudaMalloc(&d_sum_movement_pressure, h_max_particles * sizeof(float3));
+    cudaMemset(d_sum_movement_pressure, 0, h_max_particles * sizeof(float3));
 
     // Allocate hash key & value arrays
     cudaMalloc(&d_keys_in,
@@ -176,18 +196,21 @@ void FluidSimulation::update(float delta_time) {
             d_cell_end_indices, d_sum_movement_pressure, current_particles,
             h_params, delta_time);
 
-        // Update pressure
+        // Update pressure into a separate buffer so every particle reads p^l.
         updatePressureKernel<<<gridSize, kBlockSize>>>(
-            d_pos, d_density_adv, d_diag_coeff, d_pressure, d_values_out,
-            d_cell_start_indices, d_cell_end_indices, d_sum_movement_pressure,
-            d_grad_coup_vect, current_particles, h_params);
+            d_pos, d_density, d_density_adv, d_diag_coeff, d_pressure,
+            d_pressure_next, d_values_out, d_cell_start_indices,
+            d_cell_end_indices, d_sum_movement_pressure, d_grad_coup_vect,
+            current_particles, h_params, delta_time);
+        cudaMemcpy(d_pressure, d_pressure_next,
+                   current_particles * sizeof(float), cudaMemcpyDeviceToDevice);
 
-        // Update density
+        // Update density from the pressure assigned for this iteration.
         updateDensityKernel<<<gridSize, kBlockSize>>>(
-            d_pos, d_density_adv, d_diag_coeff, d_pressure, d_density_predicted,
-            d_values_out, d_cell_start_indices, d_cell_end_indices,
-            d_sum_movement_pressure, d_grad_coup_vect, current_particles,
-            h_params);
+            d_pos, d_density, d_density_adv, d_diag_coeff, d_pressure,
+            d_density_predicted, d_values_out, d_cell_start_indices,
+            d_cell_end_indices, d_sum_movement_pressure, d_grad_coup_vect,
+            current_particles, h_params, delta_time);
 
         // Compute average predicted density via CUB parallel reduction
         cub::DeviceReduce::Sum(
@@ -201,6 +224,16 @@ void FluidSimulation::update(float delta_time) {
 
         l++;
     }
+
+    // v(t+dt) = v_adv + dt * F_pressure / m, then x(t+dt) = x + dt * v(t+dt).
+    // Thesis p. 14, Eq. (4.12) and Algorithm 1 lines 21–22.
+    integrateKernel<<<gridSize, kBlockSize>>>(
+        d_pos, d_pos_next, d_vel, d_vel_adv, d_density, d_pressure, d_values_out,
+        d_cell_start_indices, d_cell_end_indices, current_particles, h_params,
+        delta_time);
+    float3* integrated_positions = d_pos;
+    d_pos = d_pos_next;
+    d_pos_next = integrated_positions;
 
     // Save current pressure as previous pressure for the next frame
     cudaMemcpy(d_pressure_prev, d_pressure, h_max_particles * sizeof(float),
@@ -255,6 +288,7 @@ void FluidSimulation::cleanup() {
         return;
 
     cudaFree(d_pos);
+    cudaFree(d_pos_next);
     cudaFree(d_vel);
     cudaFree(d_vel_adv);
     cudaFree(d_density);
@@ -262,6 +296,7 @@ void FluidSimulation::cleanup() {
     cudaFree(d_density_predicted);
     cudaFree(d_pressure);
     cudaFree(d_pressure_prev);
+    cudaFree(d_pressure_next);
     cudaFree(d_grad_coup_vect);
     cudaFree(d_diag_coeff);
     cudaFree(d_sum_movement_pressure);
@@ -276,9 +311,9 @@ void FluidSimulation::cleanup() {
     cudaFree(d_density_sum_output);
 
     // Nullify all pointers
-    d_pos = d_vel = d_vel_adv = d_grad_coup_vect = nullptr;
+    d_pos = d_pos_next = d_vel = d_vel_adv = d_grad_coup_vect = nullptr;
     d_density = d_density_adv = d_density_predicted = nullptr;
-    d_pressure = d_pressure_prev = d_diag_coeff = nullptr;
+    d_pressure = d_pressure_prev = d_pressure_next = d_diag_coeff = nullptr;
     d_sum_movement_pressure = nullptr;
     d_keys_in = d_keys_out = d_values_in = d_values_out = nullptr;
     d_cell_start_indices = d_cell_end_indices = nullptr;
@@ -289,7 +324,7 @@ void FluidSimulation::cleanup() {
 }
 
 /* Debug function: Uploads test particles for the simulation. */
-void FluidSimulation::uploadTestParticles(const std::vector<float2>& pts) {
+void FluidSimulation::uploadTestParticles(const std::vector<float3>& pts) {
     if (pts.size() > static_cast<size_t>(h_max_particles)) {
         throw std::runtime_error(
             "Test particle count exceeds max_particles defined in config.");
@@ -298,11 +333,31 @@ void FluidSimulation::uploadTestParticles(const std::vector<float2>& pts) {
     // Set active particle count to match the test batch size
     h_active_particle_count = static_cast<int>(pts.size());
 
-    cudaError_t err = cudaMemcpy(d_pos, pts.data(), pts.size() * sizeof(float2),
+    cudaError_t err = cudaMemcpy(d_pos, pts.data(), pts.size() * sizeof(float3),
                                  cudaMemcpyHostToDevice);
     if (err != cudaSuccess) {
         throw std::runtime_error(
             std::string("Failed to upload test particles: ") +
+            cudaGetErrorString(err));
+    }
+
+    // Rest velocities unless a test uploads its own.
+    cudaMemset(d_vel, 0, pts.size() * sizeof(float3));
+}
+
+/* Debug function: Uploads velocities for the active test particles. */
+void FluidSimulation::uploadTestVelocities(const std::vector<float3>& velocities) {
+    if (velocities.size() != static_cast<size_t>(h_active_particle_count)) {
+        throw std::runtime_error(
+            "Test velocity count does not match the uploaded particle count.");
+    }
+
+    cudaError_t err =
+        cudaMemcpy(d_vel, velocities.data(), velocities.size() * sizeof(float3),
+                   cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("Failed to upload test velocities: ") +
             cudaGetErrorString(err));
     }
 }
@@ -334,23 +389,43 @@ std::vector<float> FluidSimulation::copyDensitiesToHost() {
     return host_densities;
 }
 
+/* Debug function: Copies integrated positions from device to host. */
+std::vector<float3> FluidSimulation::copyPositionsToHost() const {
+    std::vector<float3> h_pos(h_active_particle_count);
+    if (d_pos != nullptr && h_active_particle_count > 0) {
+        cudaMemcpy(h_pos.data(), d_pos, h_active_particle_count * sizeof(float3),
+                   cudaMemcpyDeviceToHost);
+    }
+    return h_pos;
+}
+
+/* Debug function: Copies integrated velocities from device to host. */
+std::vector<float3> FluidSimulation::copyVelocitiesToHost() const {
+    std::vector<float3> h_vel(h_active_particle_count);
+    if (d_vel != nullptr && h_active_particle_count > 0) {
+        cudaMemcpy(h_vel.data(), d_vel, h_active_particle_count * sizeof(float3),
+                   cudaMemcpyDeviceToHost);
+    }
+    return h_vel;
+}
+
 /* Debug function: Copies the Velocity Adv array from device to host. */
-std::vector<float2> FluidSimulation::copyVelAdvToHost() const {
-    std::vector<float2> h_vel_adv(h_active_particle_count);
+std::vector<float3> FluidSimulation::copyVelAdvToHost() const {
+    std::vector<float3> h_vel_adv(h_active_particle_count);
     if (d_vel_adv != nullptr && h_active_particle_count > 0) {
         cudaMemcpy(h_vel_adv.data(), d_vel_adv,
-                   h_active_particle_count * sizeof(float2),
+                   h_active_particle_count * sizeof(float3),
                    cudaMemcpyDeviceToHost);
     }
     return h_vel_adv;
 }
 
 /* Debug function: Copies the Gradient Coupling Vector from device to host. */
-std::vector<float2> FluidSimulation::copyGradCoupToHost() const {
-    std::vector<float2> h_grad_coup(h_active_particle_count);
+std::vector<float3> FluidSimulation::copyGradCoupToHost() const {
+    std::vector<float3> h_grad_coup(h_active_particle_count);
     if (d_grad_coup_vect != nullptr && h_active_particle_count > 0) {
         cudaMemcpy(h_grad_coup.data(), d_grad_coup_vect,
-                   h_active_particle_count * sizeof(float2),
+                   h_active_particle_count * sizeof(float3),
                    cudaMemcpyDeviceToHost);
     }
     return h_grad_coup;

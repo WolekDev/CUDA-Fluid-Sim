@@ -1,32 +1,60 @@
 #include "Kernels.cuh"
-#include <math_constants.h>
+
+namespace {
+
+__device__ inline int cellCoordinate(float position, float domain_min,
+                                     float cell_size) {
+    return static_cast<int>(floorf((position - domain_min) / cell_size));
+}
+
+__device__ inline int clampCell(int cell, int count) {
+    if (cell < 0)
+        return 0;
+    if (cell >= count)
+        return count - 1;
+    return cell;
+}
+
+__device__ inline bool cellRange(const unsigned int* __restrict__ starts,
+                                 const unsigned int* __restrict__ ends,
+                                 unsigned int key, unsigned int& start,
+                                 unsigned int& end) {
+    start = starts[key];
+    end = ends[key];
+    return start <= end && start != 0xFFFFFFFFu && end != 0xFFFFFFFFu;
+}
+
+/* d_ji = -dt^2 * (m_i / rho_i^2) * grad W_ji
+ * Thesis p. 13, Eq. (4.11); Ihmsen et al., p. 4, Eq. (9) with i and j swapped. */
+__device__ inline float3 pairwiseDisplacementFromI(float3 grad_w_ji, float mass,
+                                                   float density_i, float dt2) {
+    const float scale = -dt2 * mass / (density_i * density_i);
+    return make_float3(scale * grad_w_ji.x, scale * grad_w_ji.y,
+                       scale * grad_w_ji.z);
+}
+
+} // namespace
 
 /* Compute hashes for the particles. Store in key value arrays. */
-__global__ void computeHashKernel(const float2* __restrict__ d_pos,
+__global__ void computeHashKernel(const float3* __restrict__ d_pos,
                                   unsigned int* __restrict__ d_keys,
                                   unsigned int* __restrict__ d_values,
                                   int num_particles, SimulationParams params) {
-    // Get particle's unique index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Extract particle position
-    const float2 pos = d_pos[idx];
+    const float3 pos = d_pos[idx];
+    const float cell_size = params.smoothing_radius;
 
-    // Find the cell coordinates of the particle
-    const int cx = static_cast<int>(
-        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
+    int cx = cellCoordinate(pos.x, params.domain_min_x, cell_size);
+    int cy = cellCoordinate(pos.y, params.domain_min_y, cell_size);
+    int cz = cellCoordinate(pos.z, params.domain_min_z, cell_size);
+    cx = clampCell(cx, params.grid_width);
+    cy = clampCell(cy, params.grid_height);
+    cz = clampCell(cz, params.grid_depth);
 
-    // Create hash key for the particle
-    const unsigned int hx = static_cast<unsigned int>(cx);
-    const unsigned int hy = static_cast<unsigned int>(cy);
-    const unsigned int key = hy * params.grid_width + hx;
-
-    // Update keys and values arrays with new data
-    d_keys[idx] = key;
+    d_keys[idx] = computeCellKey(cx, cy, cz, params.grid_width, params.grid_height);
     d_values[idx] = static_cast<unsigned int>(idx);
 }
 
@@ -36,16 +64,12 @@ findCellRangesKernel(const unsigned int* __restrict__ d_sorted_keys,
                      unsigned int* __restrict__ d_cell_start_indices,
                      unsigned int* __restrict__ d_cell_end_indices,
                      int num_particles) {
-    // Get particle's unique index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Get paricle's cell key
     const unsigned int current_key = d_sorted_keys[idx];
 
-    // Find the point in the keys array where a different cell is located.
-    // Update start and end position of the range.
     if (idx == 0) {
         d_cell_start_indices[current_key] = 0;
     } else {
@@ -61,235 +85,176 @@ findCellRangesKernel(const unsigned int* __restrict__ d_sorted_keys,
     }
 }
 
-/* Helper kernel for calculating the 2D Poly6 kernel weight */
-__device__ inline float computePoly6(float r2, float h2, float h) {
-    if (r2 >= h2)
-        return 0.0f;
-
-    // 2D Poly6 formula: 4 / (pi * h^8) * (h^2 - r^2)^3
-    // source: https://dl.acm.org/doi/full/10.1145/3799902.3811052
-    const float term = h2 - r2;
-    const float coeff = 4.0f / (CUDART_PI_F * powf(h, 8.0f));
-    return coeff * term * term * term;
-}
-
-/* Compute density for SPH  */
+/* rho_i(t) = sum_j m_j W_poly6(|x_i - x_j|, R)
+ * Ihmsen et al., IISPH, TVCG author's version, p. 2;
+ * thesis p. 8, Algorithm 1 line 3. W_poly6 is thesis p. 10, Eq. (4.1). */
 __global__ void
 computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
-                     const float2* __restrict__ d_pos,
+                     const float3* __restrict__ d_pos,
                      const unsigned int* __restrict__ d_cell_start_indices,
                      const unsigned int* __restrict__ d_cell_end_indices,
                      float* __restrict__ d_density, int num_particles,
                      SimulationParams params) {
-    // Get particle's unique index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Extract particle's position
-    const float2 pos = d_pos[idx];
-
-    // Get cell coordinates for particle
-    const int cx = static_cast<int>(
-        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
-
-    // Smoothing radius for furture calculations
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
+    const float3 pos = d_pos[idx];
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
+    const int cx = cellCoordinate(pos.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos.z, params.domain_min_z, support);
 
     float density = 0.0f;
 
-    // Loop through neighboring cells on x-axis
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        // Ensure x bounds
+    // Support radius equals the cell size, so only the 3x3x3 block can contribute.
+    for (int i = cx - 1; i <= cx + 1; ++i) {
         if (i < 0 || i >= params.grid_width)
             continue;
-
-        // Loop through neighboring cells on y-axis
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            // Ensure y bounds
+        for (int j = cy - 1; j <= cy + 1; ++j) {
             if (j < 0 || j >= params.grid_height)
                 continue;
+            for (int k = cz - 1; k <= cz + 1; ++k) {
+                if (k < 0 || k >= params.grid_depth)
+                    continue;
 
-            // Get hash key for the target cell
-            const unsigned int hi = static_cast<unsigned int>(i);
-            const unsigned int hj = static_cast<unsigned int>(j);
-            const unsigned int key = hj * params.grid_width + hi;
+                const unsigned int key = computeCellKey(i, j, k, params.grid_width,
+                                                        params.grid_height);
+                unsigned int start_index = 0;
+                unsigned int end_index = 0;
+                if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                               start_index, end_index))
+                    continue;
 
-            // Get start and end index for particles in this cell
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
-
-            // Ensure that the start index is before the end and that the
-            // indexes are not default value (unmodified)
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
-
-            // Loop through all particles in cell range
-            for (unsigned int k = start_index; k < end_index; ++k) {
-                // Get neighbor particle index and position
-                const unsigned int neighbor_particle_idx = d_sorted_values[k];
-                const float2 neighbor_pos = d_pos[neighbor_particle_idx];
-
-                // Calculate distance to main particle
-                const float2 rij =
-                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
-                const float r2 = rij.x * rij.x + rij.y * rij.y;
-
-                /* Check if neighbor is in range of particle based on smoothing
-                   radius. If neighbor is in radius, Use 2D Poly6 smoothing
-                   function to calculate impact of neighbor on particle. */
-                // 2D Poly6 formula: 4 / (pi * h^8) * (h^2 - r^2)^3
-                // source: https://dl.acm.org/doi/full/10.1145/3799902.3811052
-                // h = smoothing radius,
-                // r = distance between particle and neighbor,
-                if (r2 <= h2) {
-                    density += computePoly6(r2, h2, h);
+                for (unsigned int n = start_index; n < end_index; ++n) {
+                    const unsigned int neighbor_idx = d_sorted_values[n];
+                    const float3 neighbor_pos = d_pos[neighbor_idx];
+                    const float3 rij =
+                        make_float3(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y,
+                                    pos.z - neighbor_pos.z);
+                    const float r2 = dot3(rij, rij);
+                    if (r2 <= support2) {
+                        // Eq. (4.1). Self term is W(0), included when r = 0.
+                        density += params.particle_mass *
+                                   computePoly6(sqrtf(r2), support);
+                    }
                 }
             }
         }
     }
 
-    // Update particle's density
     d_density[idx] = density;
 }
 
-/* Helper kernel for calculating the 2D Spiky gradient */
-__device__ inline float2 computeSpikyGradient(float2 r_ij, float r, float h) {
-    if (r <= 0.0f || r >= h)
-        return make_float2(0.0f, 0.0f);
-
-    // 2D Spiky gradient formula: -10 / (pi * h^5) * (h - r)^2 * (r_ij / r)
-    const float factor =
-        -10.0f / (CUDART_PI_F * powf(h, 5.0f)) * powf(h - r, 2.0f);
-    const float2 normalized_r = make_float2(r_ij.x / r, r_ij.y / r);
-
-    return make_float2(factor * normalized_r.x, factor * normalized_r.y);
-}
-
-/* Computes Velocity Advection and Gradient Coupling Vector */
+/* F_i^adv = m_i g + F_i^visc, then v_i^adv = v_i + dt * F_i^adv / m_i.
+ * F_i^visc: thesis p. 11, Eq. (4.4). d_ii: Ihmsen Algorithm 1, p. 3. */
 __global__ void computeAdvectionAndGradientKernel(
-    const float2* __restrict__ d_pos, const float2* __restrict__ d_vel,
-    const float2* __restrict__ d_force_ext, float2* __restrict__ d_vel_adv,
-    const float* __restrict__ d_density, float2* __restrict__ d_grad_coup_vect,
+    const float3* __restrict__ d_pos, const float3* __restrict__ d_vel,
+    const float3* __restrict__ d_force_ext, float3* __restrict__ d_vel_adv,
+    const float* __restrict__ d_density, float3* __restrict__ d_grad_coup_vect,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices, int num_particles,
     SimulationParams params, float delta_time) {
 
-    // Get particle's unique index
     const int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Extract pos and vel of particle
     const unsigned int p_idx = d_sorted_values[idx];
-    const float2 pos_i = d_pos[p_idx];
-    const float2 vel_i = d_vel[p_idx];
+    const float3 pos_i = d_pos[p_idx];
+    const float3 vel_i = d_vel[p_idx];
+    const float mass = params.particle_mass;
 
-    // Compute advective velocity:
-    // v_i^adv = v_i + dt * (F_ext / mass)
-    // Assuming d_force_ext exists, or compute from gravity:
-    // F = mass * g
-    const float2 f_ext =
-        d_force_ext
-            ? d_force_ext[p_idx]
-            : make_float2(0.0f, params.gravity_vector.y * params.particle_mass);
-    const float2 vel_adv =
-        make_float2(vel_i.x + delta_time * (f_ext.x / params.particle_mass),
-                    vel_i.y + delta_time * (f_ext.y / params.particle_mass));
-    d_vel_adv[p_idx] = vel_adv;
-
-    // Calculate gradient coupling vector d_ii
-    // d_ii = - (dt^2) * sum_j ( (m_j / rho_i^2) * grad_W_ij )
-    float2 d_ii_sum = make_float2(0.0f, 0.0f);
     const float density_i = d_density[p_idx];
+    float3 d_ii_sum = make_float3(0.0f, 0.0f, 0.0f);
+    float3 f_visc = make_float3(0.0f, 0.0f, 0.0f);
+    if (density_i > 0.0f) {
+        const float support = params.smoothing_radius;
+        const float support2 = support * support;
+        const int cx = cellCoordinate(pos_i.x, params.domain_min_x, support);
+        const int cy = cellCoordinate(pos_i.y, params.domain_min_y, support);
+        const int cz = cellCoordinate(pos_i.z, params.domain_min_z, support);
+        const float density_scale = mass / (density_i * density_i);
+        // Eq. (4.4): (m_j / rho_i)^2 * mu, with mu in Pa·s.
+        const float mass_over_density = mass / density_i;
+        const float visc_scale = mass_over_density * mass_over_density *
+                                 dynamicViscosityPascalSeconds(params.viscosity);
 
-    // Get cell coordinates for particle
-    const int cx = static_cast<int>(
-        floorf((pos_i.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos_i.y - params.domain_min_y) / params.smoothing_radius));
-
-    // Smothing radius for future calculations
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
-
-    // Loop through neighboring cells on x-axis
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        // Ensure x bounds
-        if (i < 0 || i >= params.grid_width)
-            continue;
-
-        // Loop through neighboring cells on y-axis
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            // Ensure y bounds
-            if (j < 0 || j >= params.grid_height)
+        for (int i = cx - 1; i <= cx + 1; ++i) {
+            if (i < 0 || i >= params.grid_width)
                 continue;
+            for (int j = cy - 1; j <= cy + 1; ++j) {
+                if (j < 0 || j >= params.grid_height)
+                    continue;
+                for (int k = cz - 1; k <= cz + 1; ++k) {
+                    if (k < 0 || k >= params.grid_depth)
+                        continue;
 
-            // Get hash key for the target cell
-            const unsigned int hi = static_cast<unsigned int>(i);
-            const unsigned int hj = static_cast<unsigned int>(j);
-            const unsigned int key = hj * params.grid_width + hi;
+                    const unsigned int key = computeCellKey(
+                        i, j, k, params.grid_width, params.grid_height);
+                    unsigned int start_index = 0;
+                    unsigned int end_index = 0;
+                    if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                                   start_index, end_index))
+                        continue;
 
-            // Get start and end index for particles in this cell
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
+                    for (unsigned int n = start_index; n < end_index; ++n) {
+                        const unsigned int neighbor_idx = d_sorted_values[n];
+                        const float3 pos_j = d_pos[neighbor_idx];
+                        const float3 r_ij =
+                            make_float3(pos_i.x - pos_j.x, pos_i.y - pos_j.y,
+                                        pos_i.z - pos_j.z);
+                        const float r2 = dot3(r_ij, r_ij);
+                        if (r2 >= support2)
+                            continue;
 
-            // Ensure that the start index is before the end and that the
-            // indexes are not default value (unmodified)
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
+                        const float distance = sqrtf(r2);
+                        if (distance > 0.0f) {
+                            const float3 grad_w_ij =
+                                computeSpikyGradient(r_ij, distance, support);
+                            d_ii_sum.x += density_scale * grad_w_ij.x;
+                            d_ii_sum.y += density_scale * grad_w_ij.y;
+                            d_ii_sum.z += density_scale * grad_w_ij.z;
+                        }
 
-            // Loop through all particles in cell range
-            for (unsigned int k = start_index; k < end_index; ++k) {
-
-                // Get neighbor position
-                const unsigned int neighbor_idx = d_sorted_values[k];
-                const float2 pos_j = d_pos[neighbor_idx];
-
-                // Calculate distance between main particle and neighbor
-                const float2 r_ij =
-                    make_float2(pos_i.x - pos_j.x, pos_i.y - pos_j.y);
-                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
-
-                // If neighbor in range of main, add its contribution to d_ii,
-                // the gradient coupling vector.
-                // Spiky kernel gradient is used here as Poly6 does not have
-                // repulsion as r approaches 0. Spiky prevents particle overlap.
-                // r = distance between neighbor and main particle
-                // h = smoothing radius
-                if (r2 > 0.0f && r2 < h2) {
-                    const float r = sqrtf(r2);
-                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
-
-                    // Calculate the gradient coupling vector
-                    // d_ii += m_j / rho_i^2 * grad_W_ij
-                    const float scalar =
-                        params.particle_mass / (density_i * density_i);
-                    d_ii_sum.x += scalar * grad_w_ij.x;
-                    d_ii_sum.y += scalar * grad_w_ij.y;
+                        // Eq. (4.4): -(v_i - v_j) * (m_j / rho_i)^2 * Const_visc * W
+                        const float3 vel_j = d_vel[neighbor_idx];
+                        const float weight = computeViscosity(distance, support);
+                        const float coeff = visc_scale * weight;
+                        f_visc.x += -(vel_i.x - vel_j.x) * coeff;
+                        f_visc.y += -(vel_i.y - vel_j.y) * coeff;
+                        f_visc.z += -(vel_i.z - vel_j.z) * coeff;
+                    }
                 }
             }
         }
     }
 
-    // Finalize d_ii: multiply by -(dt^2)
-    float dt_sq = delta_time * delta_time;
+    // F_adv = F_ext + F_visc, then v_adv = v + dt * F_adv / m. Thesis p. 11.
+    const float3 f_ext =
+        d_force_ext ? d_force_ext[p_idx]
+                    : make_float3(params.gravity_vector.x * mass,
+                                  params.gravity_vector.y * mass,
+                                  params.gravity_vector.z * mass);
+    const float inv_mass = 1.0f / mass;
+    d_vel_adv[p_idx] = make_float3(
+        vel_i.x + delta_time * (f_ext.x + f_visc.x) * inv_mass,
+        vel_i.y + delta_time * (f_ext.y + f_visc.y) * inv_mass,
+        vel_i.z + delta_time * (f_ext.z + f_visc.z) * inv_mass);
+
+    const float dt2 = delta_time * delta_time;
     d_grad_coup_vect[p_idx] =
-        make_float2(-dt_sq * d_ii_sum.x, -dt_sq * d_ii_sum.y);
+        make_float3(-dt2 * d_ii_sum.x, -dt2 * d_ii_sum.y, -dt2 * d_ii_sum.z);
 }
 
-/* Initialize pressure solver. Calculates density advection, initial pressure,
- * and the diagonal coefficient for the pressure matrix. */
+/* rho_i^adv from Ihmsen Eq. (4), p_i^0 = 0.5 p_i(t - dt), and
+ * a_ii from Ihmsen Eq. (12) using d_ji from thesis Eq. (4.11). */
 __global__ void initPressureSolverKernel(
-    const float2* __restrict__ d_pos, const float2* __restrict__ d_vel_adv,
+    const float3* __restrict__ d_pos, const float3* __restrict__ d_vel_adv,
     const float* __restrict__ d_density, float* __restrict__ d_density_adv,
-    const float2* __restrict__ d_grad_coup_vect,
+    const float3* __restrict__ d_grad_coup_vect,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
@@ -297,337 +262,276 @@ __global__ void initPressureSolverKernel(
     float* __restrict__ d_diag_coeff, int num_particles,
     SimulationParams params, float delta_time) {
 
-    // Get particle's unique index
     const int idx = blockDim.x * blockIdx.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Extract pos, vel, and mass of particle
     const unsigned int p_idx = d_sorted_values[idx];
-    const float2 pos_i = d_pos[p_idx];
+    const float3 pos_i = d_pos[p_idx];
     const float mass = params.particle_mass;
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
+    const float density_i = d_density[p_idx];
+    const float3 d_ii = d_grad_coup_vect[p_idx];
+    const float3 vel_adv_i = d_vel_adv[p_idx];
+    const float dt2 = delta_time * delta_time;
 
-    // Get cell coordinates for particle
-    const int cx = static_cast<int>(
-        floorf((pos_i.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos_i.y - params.domain_min_y) / params.smoothing_radius));
+    // p_i^0 = 0.5 * p_i(t - dt). Ihmsen et al., p. 4; thesis p. 12.
+    d_pressure[p_idx] = 0.5f * d_pressure_prev[p_idx];
 
-    // Smothing radius for future calculations
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
-
-    // init sums
     float density_adv_sum = 0.0f;
     float a_ii_sum = 0.0f;
 
-    // d_ii and vel adv for the current particle.
-    const float2 d_ii = d_grad_coup_vect[p_idx];
-    const float2 vel_adv_i = d_vel_adv[p_idx];
+    const int cx = cellCoordinate(pos_i.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos_i.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos_i.z, params.domain_min_z, support);
 
-    // Calculate Pi^0 (initial guess for pressure solver)
-    // Pi^0 = 0.5pi(t − ∆t)
-    d_pressure[p_idx] = 0.5 * d_pressure_prev[p_idx];
-
-    // Loop through neighboring cells on x-axis
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        // Ensure x bounds
+    for (int i = cx - 1; i <= cx + 1; ++i) {
         if (i < 0 || i >= params.grid_width)
             continue;
-
-        // Loop through neighboring cells on y-axis
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            // Ensure y bounds
+        for (int j = cy - 1; j <= cy + 1; ++j) {
             if (j < 0 || j >= params.grid_height)
                 continue;
+            for (int k = cz - 1; k <= cz + 1; ++k) {
+                if (k < 0 || k >= params.grid_depth)
+                    continue;
 
-            // Get hash key for the target cell
-            const unsigned int hi = static_cast<unsigned int>(i);
-            const unsigned int hj = static_cast<unsigned int>(j);
-            const unsigned int key = hj * params.grid_width + hi;
+                const unsigned int key = computeCellKey(i, j, k, params.grid_width,
+                                                        params.grid_height);
+                unsigned int start_index = 0;
+                unsigned int end_index = 0;
+                if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                               start_index, end_index))
+                    continue;
 
-            // Get start and end index for particles in this cell
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
+                for (unsigned int n = start_index; n < end_index; ++n) {
+                    const unsigned int neighbor_idx = d_sorted_values[n];
+                    const float3 pos_j = d_pos[neighbor_idx];
+                    const float3 r_ij = make_float3(pos_i.x - pos_j.x,
+                                                    pos_i.y - pos_j.y,
+                                                    pos_i.z - pos_j.z);
+                    const float r2 = dot3(r_ij, r_ij);
+                    if (r2 <= 0.0f || r2 >= support2 || density_i <= 0.0f)
+                        continue;
 
-            // Ensure that the start index is before the end and that the
-            // indexes are not default value (unmodified)
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
+                    const float distance = sqrtf(r2);
+                    const float3 grad_w_ij =
+                        computeSpikyGradient(r_ij, distance, support);
+                    const float3 r_ji =
+                        make_float3(-r_ij.x, -r_ij.y, -r_ij.z);
+                    const float3 grad_w_ji =
+                        computeSpikyGradient(r_ji, distance, support);
 
-            // Loop through all particles in cell range
-            for (unsigned int k = start_index; k < end_index; ++k) {
+                    // Eq. (4): m_j (v_i^adv - v_j^adv) · grad W_ij
+                    const float3 vel_adv_j = d_vel_adv[neighbor_idx];
+                    const float3 relative_vel =
+                        make_float3(vel_adv_i.x - vel_adv_j.x,
+                                    vel_adv_i.y - vel_adv_j.y,
+                                    vel_adv_i.z - vel_adv_j.z);
+                    density_adv_sum += mass * dot3(relative_vel, grad_w_ij);
 
-                // Get neighbor position
-                const unsigned int neighbor_idx = d_sorted_values[k];
-                const float2 pos_j = d_pos[neighbor_idx];
-
-                // Calculate distance between main particle and neighbor
-                const float2 r_ij =
-                    make_float2(pos_i.x - pos_j.x, pos_i.y - pos_j.y);
-                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
-
-                // For all neighbors in range, calculate weighted contribution
-                // to density adv.
-                // Formula:
-                // rho_adv_sum += mass * (relative_vel_adv dot gradient)
-
-                // Also, calculate a_ii the diagonal coefficient.
-                // Formula:
-                // a_ii_sum += mass * ( (d_ii - d_ji) dot gradient)
-                if (r2 > 0.0f && r2 < h2) {
-                    const float r = sqrtf(r2);
-
-                    // Density adv
-                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
-
-                    const float2 neighbor_vel_adv = d_vel_adv[neighbor_idx];
-                    const float2 relative_vel_adv =
-                        make_float2(vel_adv_i.x - neighbor_vel_adv.x,
-                                    vel_adv_i.y - neighbor_vel_adv.y);
-
-                    const float dot_product_density =
-                        relative_vel_adv.x * grad_w_ij.x +
-                        relative_vel_adv.y * grad_w_ij.y;
-
-                    density_adv_sum += mass * dot_product_density;
-
-                    // a_ii sum
-                    const float2 d_ji = d_grad_coup_vect[neighbor_idx];
-                    const float2 d_diff =
-                        make_float2(d_ii.x - d_ji.x, d_ii.y - d_ji.y);
-
-                    // Negate the dot product to account for the gradient vector
-                    // orientation
-                    const float dot_product_a_ii =
-                        -(d_diff.x * grad_w_ij.x + d_diff.y * grad_w_ij.y);
-
-                    a_ii_sum += mass * dot_product_a_ii;
+                    // Eq. (12): m_j (d_ii - d_ji) · grad W_ij
+                    const float3 d_ji = pairwiseDisplacementFromI(
+                        grad_w_ji, mass, density_i, dt2);
+                    const float3 difference =
+                        make_float3(d_ii.x - d_ji.x, d_ii.y - d_ji.y,
+                                    d_ii.z - d_ji.z);
+                    a_ii_sum += mass * dot3(difference, grad_w_ij);
                 }
             }
         }
     }
 
-    // Finish calculating density adv and a_ii
-    d_density_adv[p_idx] = density_adv_sum * delta_time + d_density[p_idx];
+    d_density_adv[p_idx] = d_density[p_idx] + delta_time * density_adv_sum;
     d_diag_coeff[p_idx] = a_ii_sum;
 }
 
-/* This is the kernel for solving SUM(dij * Pj^l). This equation refers to the
- * total movement based on pressure forces for each particle. This is needed for
- * the main pressure solver kernel.
- * Equation: SUM(d_ji * P_j^l) = dt^2 * SUM_j( p_j * (-mj / (rho_j(t)^2) ) dot
- * Wij)*/
+/* sum_j d_ij p_j^l = dt^2 * sum_j (-m_j / rho_j^2) p_j^l grad W_ij
+ * Ihmsen et al., p. 3, Algorithm 1; thesis p. 8 line 14. */
 __global__ void calculateSumMovementFromPressureKernel(
-    const float2* __restrict__ d_pos, const float* __restrict__ d_density,
+    const float3* __restrict__ d_pos, const float* __restrict__ d_density,
     const float* __restrict__ d_pressure,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
-    float2* __restrict__ d_sum_movement_pressure, int num_particles,
+    float3* __restrict__ d_sum_movement_pressure, int num_particles,
     SimulationParams params, float delta_time) {
 
-    // Get particle's unique index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Extract particle's position
-    const float2 pos = d_pos[idx];
-
-    // Get cell coordinates for particle
-    const int cx = static_cast<int>(
-        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
-
-    // Variables for calculation
+    const float3 pos = d_pos[idx];
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
     const float mass = params.particle_mass;
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
-    float2 sum = make_float2(0.0f, 0.0f);
+    const int cx = cellCoordinate(pos.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos.z, params.domain_min_z, support);
 
-    // Loop through neighboring cells on x-axis
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        // Ensure x bounds
+    float3 sum = make_float3(0.0f, 0.0f, 0.0f);
+
+    for (int i = cx - 1; i <= cx + 1; ++i) {
         if (i < 0 || i >= params.grid_width)
             continue;
-
-        // Loop through neighboring cells on y-axis
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            // Ensure y bounds
+        for (int j = cy - 1; j <= cy + 1; ++j) {
             if (j < 0 || j >= params.grid_height)
                 continue;
+            for (int k = cz - 1; k <= cz + 1; ++k) {
+                if (k < 0 || k >= params.grid_depth)
+                    continue;
 
-            // Get hash key for the target cell
-            const unsigned int hi = static_cast<unsigned int>(i);
-            const unsigned int hj = static_cast<unsigned int>(j);
-            const unsigned int key = hj * params.grid_width + hi;
+                const unsigned int key = computeCellKey(i, j, k, params.grid_width,
+                                                        params.grid_height);
+                unsigned int start_index = 0;
+                unsigned int end_index = 0;
+                if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                               start_index, end_index))
+                    continue;
 
-            // Get start and end index for particles in this cell
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
+                for (unsigned int n = start_index; n < end_index; ++n) {
+                    const unsigned int neighbor_idx = d_sorted_values[n];
+                    const float3 neighbor_pos = d_pos[neighbor_idx];
+                    const float3 r_ij =
+                        make_float3(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y,
+                                    pos.z - neighbor_pos.z);
+                    const float r2 = dot3(r_ij, r_ij);
+                    if (r2 <= 0.0f || r2 >= support2)
+                        continue;
 
-            // Ensure that the start index is before the end and that the
-            // indexes are not default value (unmodified)
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
-
-            // Loop through all particles in cell range
-            for (unsigned int k = start_index; k < end_index; ++k) {
-                // Get neighbor particle index and position
-                const unsigned int neighbor_idx = d_sorted_values[k];
-                const float2 neighbor_pos = d_pos[neighbor_idx];
-
-                // Calculate distance to main particle
-                const float2 r_ij =
-                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
-                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
-
-                /* Check if neighbor is in range of particle based on smoothing
-                   radius. */
-                // h = smoothing radius,
-                // r = distance between particle and neighbor,
-                if (r2 > 0.0f && r2 <= h2) {
                     const float density_j = d_density[neighbor_idx];
-                    const float pressure_j = d_pressure[neighbor_idx];
+                    if (density_j <= 0.0f)
+                        continue;
 
-                    // Coefficient including mass, density, and neighbor
-                    // pressure
-                    const float coeff =
-                        pressure_j * (mass / (density_j * density_j));
-
-                    const float r = sqrtf(r2);
-                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
-
-                    // Accumulate term: sum(d_ij * P_j) where d_ij contains the
-                    // gradient factor
+                    // -p_j * m_j / rho_j^2 * grad W_ij
+                    const float coeff = -d_pressure[neighbor_idx] * mass /
+                                        (density_j * density_j);
+                    const float3 grad_w_ij =
+                        computeSpikyGradient(r_ij, sqrtf(r2), support);
                     sum.x += coeff * grad_w_ij.x;
                     sum.y += coeff * grad_w_ij.y;
+                    sum.z += coeff * grad_w_ij.z;
                 }
             }
         }
     }
 
-    // Finalize calculation and set value in buffer.
-    d_sum_movement_pressure[idx].x = delta_time * delta_time * sum.x;
-    d_sum_movement_pressure[idx].y = delta_time * delta_time * sum.y;
+    const float dt2 = delta_time * delta_time;
+    d_sum_movement_pressure[idx] =
+        make_float3(dt2 * sum.x, dt2 * sum.y, dt2 * sum.z);
 }
 
-/* Main pressure solver kernel. Computes p_i^(l+1) for the next iteration of the
- * loop.
- *
- * Equation Pressure: p_i^(l+1) = (1-omega)*p_i^l + (omega/a_ii) * (rest_density
- * - rho_i^adv - SUM_j(mass_j * (SUM_j(d_ij * p_j^l) - d_jj*p_j -
- * SUM_k!=i(d_jk*p_k^l))) dot W_ij) */
+/* Eq. (13) / thesis Eq. (4.8). The result is written to d_pressure_next so
+ * every particle reads the same p^l. Negative pressure is clamped to 0. */
 __global__ void updatePressureKernel(
-    const float2* __restrict__ d_pos, const float* __restrict__ d_density_adv,
-    const float* __restrict__ d_diag_coeff, float* __restrict__ d_pressure,
+    const float3* __restrict__ d_pos, const float* __restrict__ d_density,
+    const float* __restrict__ d_density_adv,
+    const float* __restrict__ d_diag_coeff,
+    const float* __restrict__ d_pressure, float* __restrict__ d_pressure_next,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
-    const float2* __restrict__ d_sum_movement_pressure,
-    const float2* __restrict__ d_grad_coup_vect, int num_particles,
-    SimulationParams params) {
+    const float3* __restrict__ d_sum_movement_pressure,
+    const float3* __restrict__ d_grad_coup_vect, int num_particles,
+    SimulationParams params, float delta_time) {
 
-    // Get particle index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Get particle position and cell coordinates
-    const float2 pos = d_pos[idx];
-    const int cx = static_cast<int>(
-        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
-
-    // Variables for calculations
+    const float3 pos = d_pos[idx];
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
     const float mass = params.particle_mass;
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
-    const float rho_0 = params.rest_density;
     const float omega = params.relaxation_factor;
-
-    // Precalculated variables
+    const float density_i = d_density[idx];
     const float rho_i_adv = d_density_adv[idx];
     const float p_i_l = d_pressure[idx];
     const float a_ii = d_diag_coeff[idx];
-    const float2 sum_dij_pj = d_sum_movement_pressure[idx];
-    const float2 d_ji_self = d_grad_coup_vect[idx];
+    const float3 sum_dij_pj = d_sum_movement_pressure[idx];
+    const float dt2 = delta_time * delta_time;
+    const int cx = cellCoordinate(pos.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos.z, params.domain_min_z, support);
 
     float neighbor_sum = 0.0f;
 
-    // Neighbor search grid traversal
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        if (i < 0 || i >= params.grid_width)
-            continue;
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            if (j < 0 || j >= params.grid_height)
+    if (density_i > 0.0f) {
+        for (int i = cx - 1; i <= cx + 1; ++i) {
+            if (i < 0 || i >= params.grid_width)
                 continue;
-
-            // Look up cell start and end range
-            const unsigned int key = j * params.grid_width + i;
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
-
-            // Check that cell indexes are valid and initialized
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
-
-            // Loop through all particles in cell
-            for (unsigned int k = start_index; k < end_index; ++k) {
-                const unsigned int neighbor_idx = d_sorted_values[k];
-                if (neighbor_idx == idx)
+            for (int j = cy - 1; j <= cy + 1; ++j) {
+                if (j < 0 || j >= params.grid_height)
                     continue;
+                for (int k = cz - 1; k <= cz + 1; ++k) {
+                    if (k < 0 || k >= params.grid_depth)
+                        continue;
 
-                const float2 neighbor_pos = d_pos[neighbor_idx];
-                const float2 r_ij =
-                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
-                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+                    const unsigned int key = computeCellKey(
+                        i, j, k, params.grid_width, params.grid_height);
+                    unsigned int start_index = 0;
+                    unsigned int end_index = 0;
+                    if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                                   start_index, end_index))
+                        continue;
 
-                // ensure neighbor is in range of main particle
-                if (r2 > 0.0f && r2 <= h2) {
-                    const float r = sqrtf(r2);
-                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+                    for (unsigned int n = start_index; n < end_index; ++n) {
+                        const unsigned int neighbor_idx = d_sorted_values[n];
+                        if (neighbor_idx == static_cast<unsigned int>(idx))
+                            continue;
 
-                    const float2 sum_djk_pk_j =
-                        d_sum_movement_pressure[neighbor_idx];
-                    const float2 d_jj = d_grad_coup_vect[neighbor_idx];
-                    const float p_j = d_pressure[neighbor_idx];
+                        const float3 neighbor_pos = d_pos[neighbor_idx];
+                        const float3 r_ij = make_float3(pos.x - neighbor_pos.x,
+                                                        pos.y - neighbor_pos.y,
+                                                        pos.z - neighbor_pos.z);
+                        const float r2 = dot3(r_ij, r_ij);
+                        if (r2 <= 0.0f || r2 >= support2)
+                            continue;
 
-                    // Evaluate inner bracket term
-                    float2 inner_bracket =
-                        make_float2(sum_dij_pj.x - (d_jj.x * p_j) -
-                                        (sum_djk_pk_j.x - d_ji_self.x * p_i_l),
-                                    sum_dij_pj.y - (d_jj.y * p_j) -
-                                        (sum_djk_pk_j.y - d_ji_self.y * p_i_l));
+                        const float distance = sqrtf(r2);
+                        const float3 grad_w_ij =
+                            computeSpikyGradient(r_ij, distance, support);
+                        const float3 grad_w_ji = computeSpikyGradient(
+                            make_float3(-r_ij.x, -r_ij.y, -r_ij.z), distance,
+                            support);
 
-                    neighbor_sum += mass * (inner_bracket.x * grad_w_ij.x +
-                                            inner_bracket.y * grad_w_ij.y);
+                        // sum_{k != i} d_jk p_k = sum_k d_jk p_k - d_ji p_i
+                        // Ihmsen et al., p. 4, Eq. (11); thesis p. 13, Eq. (4.10).
+                        const float3 d_ji = pairwiseDisplacementFromI(
+                            grad_w_ji, mass, density_i, dt2);
+                        const float3 sum_djk_pk = d_sum_movement_pressure[neighbor_idx];
+                        const float3 d_jj = d_grad_coup_vect[neighbor_idx];
+                        const float p_j = d_pressure[neighbor_idx];
+                        const float3 excluded = make_float3(
+                            sum_djk_pk.x - d_ji.x * p_i_l,
+                            sum_djk_pk.y - d_ji.y * p_i_l,
+                            sum_djk_pk.z - d_ji.z * p_i_l);
+                        const float3 inner = make_float3(
+                            sum_dij_pj.x - d_jj.x * p_j - excluded.x,
+                            sum_dij_pj.y - d_jj.y * p_j - excluded.y,
+                            sum_dij_pj.z - d_jj.z * p_j - excluded.z);
+                        neighbor_sum += mass * dot3(inner, grad_w_ij);
+                    }
                 }
             }
         }
     }
 
-    // Update & clamp pressure
     float updated_pressure = p_i_l;
-    if (a_ii > 1e-12f) {
+    if (a_ii > 1e-12f || a_ii < -1e-12f) {
+        // Eq. (13) / Eq. (4.8), then clamp negative pressure to 0 (p. 4 / p. 14).
         updated_pressure = (1.0f - omega) * p_i_l +
-                           (omega / a_ii) * (rho_0 - rho_i_adv - neighbor_sum);
+                           (omega / a_ii) * (params.rest_density - rho_i_adv -
+                                             neighbor_sum);
         updated_pressure = fmaxf(0.0f, updated_pressure);
     }
-    d_pressure[idx] = updated_pressure;
+    d_pressure_next[idx] = updated_pressure;
 }
 
-/* Computes rho_i^l for the next iteration of the loop.
- *
- * Equation Density: rho_i^l = rho_i^adv + a_ii * p_i^l + SUM_j(d_ij * p_j^l) */
+/* Eq. (4.7), using the pressure assigned for this iteration. */
 __global__ void
-updateDensityKernel(const float2* __restrict__ d_pos,
+updateDensityKernel(const float3* __restrict__ d_pos,
+                    const float* __restrict__ d_density,
                     const float* __restrict__ d_density_adv,
                     const float* __restrict__ d_diag_coeff,
                     const float* __restrict__ d_pressure,
@@ -635,90 +539,177 @@ updateDensityKernel(const float2* __restrict__ d_pos,
                     const unsigned int* __restrict__ d_sorted_values,
                     const unsigned int* __restrict__ d_cell_start_indices,
                     const unsigned int* __restrict__ d_cell_end_indices,
-                    const float2* __restrict__ d_sum_movement_pressure,
-                    const float2* __restrict__ d_grad_coup_vect,
-                    int num_particles, SimulationParams params) {
+                    const float3* __restrict__ d_sum_movement_pressure,
+                    const float3* __restrict__ d_grad_coup_vect,
+                    int num_particles, SimulationParams params,
+                    float delta_time) {
 
-    // Get particle index
     const int idx = blockIdx.x * blockDim.x + threadIdx.x;
     if (idx >= num_particles)
         return;
 
-    // Get particle position and cell coordinates
-    const float2 pos = d_pos[idx];
-    const int cx = static_cast<int>(
-        floorf((pos.x - params.domain_min_x) / params.smoothing_radius));
-    const int cy = static_cast<int>(
-        floorf((pos.y - params.domain_min_y) / params.smoothing_radius));
-
-    // Variables for calculations
+    const float3 pos = d_pos[idx];
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
     const float mass = params.particle_mass;
-    const float h = params.smoothing_radius;
-    const float h2 = h * h;
-
-    // Precalculated variables
+    const float density_i = d_density[idx];
     const float rho_i_adv = d_density_adv[idx];
-    const float p_i_updated =
-        d_pressure[idx]; // Uses the freshly updated pressure p^(l+1)
+    const float p_i = d_pressure[idx];
     const float a_ii = d_diag_coeff[idx];
-    const float2 sum_dij_pj = d_sum_movement_pressure[idx];
-    const float2 d_ji_self = d_grad_coup_vect[idx];
+    const float3 sum_dij_pj = d_sum_movement_pressure[idx];
+    const float dt2 = delta_time * delta_time;
+    const int cx = cellCoordinate(pos.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos.z, params.domain_min_z, support);
 
     float neighbor_sum = 0.0f;
 
-    // Neighbor search grid traversal
-    for (int i = cx - 1; i <= cx + 1; i++) {
-        if (i < 0 || i >= params.grid_width)
-            continue;
-        for (int j = cy - 1; j <= cy + 1; j++) {
-            if (j < 0 || j >= params.grid_height)
+    if (density_i > 0.0f) {
+        for (int i = cx - 1; i <= cx + 1; ++i) {
+            if (i < 0 || i >= params.grid_width)
                 continue;
-
-            // Look up cell start and end range
-            const unsigned int key = j * params.grid_width + i;
-            const unsigned int start_index = d_cell_start_indices[key];
-            const unsigned int end_index = d_cell_end_indices[key];
-
-            // Check that cell indexes are valid and initialized
-            if (start_index > end_index || start_index == 0xFFFFFFFFu ||
-                end_index == 0xFFFFFFFFu)
-                continue;
-
-            // Loop through all particles in cell
-            for (unsigned int k = start_index; k < end_index; ++k) {
-                const unsigned int neighbor_idx = d_sorted_values[k];
-                if (neighbor_idx == idx)
+            for (int j = cy - 1; j <= cy + 1; ++j) {
+                if (j < 0 || j >= params.grid_height)
                     continue;
+                for (int k = cz - 1; k <= cz + 1; ++k) {
+                    if (k < 0 || k >= params.grid_depth)
+                        continue;
 
-                const float2 neighbor_pos = d_pos[neighbor_idx];
-                const float2 r_ij =
-                    make_float2(pos.x - neighbor_pos.x, pos.y - neighbor_pos.y);
-                const float r2 = r_ij.x * r_ij.x + r_ij.y * r_ij.y;
+                    const unsigned int key = computeCellKey(
+                        i, j, k, params.grid_width, params.grid_height);
+                    unsigned int start_index = 0;
+                    unsigned int end_index = 0;
+                    if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                                   start_index, end_index))
+                        continue;
 
-                // ensure neighbor is in range of main particle
-                if (r2 > 0.0f && r2 <= h2) {
-                    const float r = sqrtf(r2);
-                    const float2 grad_w_ij = computeSpikyGradient(r_ij, r, h);
+                    for (unsigned int n = start_index; n < end_index; ++n) {
+                        const unsigned int neighbor_idx = d_sorted_values[n];
+                        if (neighbor_idx == static_cast<unsigned int>(idx))
+                            continue;
 
-                    const float2 sum_djk_pk_j =
-                        d_sum_movement_pressure[neighbor_idx];
-                    const float2 d_jj = d_grad_coup_vect[neighbor_idx];
-                    const float p_j = d_pressure[neighbor_idx];
+                        const float3 neighbor_pos = d_pos[neighbor_idx];
+                        const float3 r_ij = make_float3(pos.x - neighbor_pos.x,
+                                                        pos.y - neighbor_pos.y,
+                                                        pos.z - neighbor_pos.z);
+                        const float r2 = dot3(r_ij, r_ij);
+                        if (r2 <= 0.0f || r2 >= support2)
+                            continue;
 
-                    float2 inner_bracket = make_float2(
-                        sum_dij_pj.x - (d_jj.x * p_j) -
-                            (sum_djk_pk_j.x - d_ji_self.x * p_i_updated),
-                        sum_dij_pj.y - (d_jj.y * p_j) -
-                            (sum_djk_pk_j.y - d_ji_self.y * p_i_updated));
-
-                    neighbor_sum += mass * (inner_bracket.x * grad_w_ij.x +
-                                            inner_bracket.y * grad_w_ij.y);
+                        const float distance = sqrtf(r2);
+                        const float3 grad_w_ij =
+                            computeSpikyGradient(r_ij, distance, support);
+                        const float3 grad_w_ji = computeSpikyGradient(
+                            make_float3(-r_ij.x, -r_ij.y, -r_ij.z), distance,
+                            support);
+                        const float3 d_ji = pairwiseDisplacementFromI(
+                            grad_w_ji, mass, density_i, dt2);
+                        const float3 sum_djk_pk = d_sum_movement_pressure[neighbor_idx];
+                        const float3 d_jj = d_grad_coup_vect[neighbor_idx];
+                        const float p_j = d_pressure[neighbor_idx];
+                        const float3 excluded = make_float3(
+                            sum_djk_pk.x - d_ji.x * p_i,
+                            sum_djk_pk.y - d_ji.y * p_i,
+                            sum_djk_pk.z - d_ji.z * p_i);
+                        const float3 inner = make_float3(
+                            sum_dij_pj.x - d_jj.x * p_j - excluded.x,
+                            sum_dij_pj.y - d_jj.y * p_j - excluded.y,
+                            sum_dij_pj.z - d_jj.z * p_j - excluded.z);
+                        neighbor_sum += mass * dot3(inner, grad_w_ij);
+                    }
                 }
             }
         }
     }
 
-    // Predicted density for convergence check: rho^(l+1) = rho_adv + a_ii *
-    // p_updated + neighbor_sum
-    d_density_predicted[idx] = rho_i_adv + (a_ii * p_i_updated) + neighbor_sum;
+    // rho^{l+1} = rho^adv + a_ii * p + neighbor sum. Thesis Eq. (4.7).
+    d_density_predicted[idx] = rho_i_adv + a_ii * p_i + neighbor_sum;
+}
+
+/* F_i^p / m_i = -sum_j m_j (p_i/rho_i^2 + p_j/rho_j^2) grad W_ij
+ * Ihmsen et al., p. 2, Eq. (2); thesis p. 14, Eq. (4.12).
+ * v and x: Algorithm 1, Ihmsen p. 3 and thesis p. 14. */
+__global__ void integrateKernel(
+    const float3* __restrict__ d_pos, float3* __restrict__ d_pos_next,
+    float3* __restrict__ d_vel, const float3* __restrict__ d_vel_adv,
+    const float* __restrict__ d_density, const float* __restrict__ d_pressure,
+    const unsigned int* __restrict__ d_sorted_values,
+    const unsigned int* __restrict__ d_cell_start_indices,
+    const unsigned int* __restrict__ d_cell_end_indices, int num_particles,
+    SimulationParams params, float delta_time) {
+
+    const int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= num_particles)
+        return;
+
+    const float3 pos = d_pos[idx];
+    const float support = params.smoothing_radius;
+    const float support2 = support * support;
+    const float mass = params.particle_mass;
+    const float density_i = d_density[idx];
+    const float pressure_i = d_pressure[idx];
+    const int cx = cellCoordinate(pos.x, params.domain_min_x, support);
+    const int cy = cellCoordinate(pos.y, params.domain_min_y, support);
+    const int cz = cellCoordinate(pos.z, params.domain_min_z, support);
+
+    float3 pressure_sum = make_float3(0.0f, 0.0f, 0.0f);
+    if (density_i > 0.0f) {
+        const float inv_density_i2 = 1.0f / (density_i * density_i);
+        for (int i = cx - 1; i <= cx + 1; ++i) {
+            if (i < 0 || i >= params.grid_width)
+                continue;
+            for (int j = cy - 1; j <= cy + 1; ++j) {
+                if (j < 0 || j >= params.grid_height)
+                    continue;
+                for (int k = cz - 1; k <= cz + 1; ++k) {
+                    if (k < 0 || k >= params.grid_depth)
+                        continue;
+
+                    const unsigned int key = computeCellKey(
+                        i, j, k, params.grid_width, params.grid_height);
+                    unsigned int start_index = 0;
+                    unsigned int end_index = 0;
+                    if (!cellRange(d_cell_start_indices, d_cell_end_indices, key,
+                                   start_index, end_index))
+                        continue;
+
+                    for (unsigned int n = start_index; n < end_index; ++n) {
+                        const unsigned int neighbor_idx = d_sorted_values[n];
+                        const float3 neighbor_pos = d_pos[neighbor_idx];
+                        const float3 r_ij = make_float3(pos.x - neighbor_pos.x,
+                                                        pos.y - neighbor_pos.y,
+                                                        pos.z - neighbor_pos.z);
+                        const float r2 = dot3(r_ij, r_ij);
+                        if (r2 <= 0.0f || r2 >= support2)
+                            continue;
+
+                        const float density_j = d_density[neighbor_idx];
+                        if (density_j <= 0.0f)
+                            continue;
+
+                        // Eq. (4.12): m_j (p_i/rho_i^2 + p_j/rho_j^2) grad W_ij
+                        const float coeff =
+                            mass * (pressure_i * inv_density_i2 +
+                                    d_pressure[neighbor_idx] /
+                                        (density_j * density_j));
+                        const float3 grad_w_ij =
+                            computeSpikyGradient(r_ij, sqrtf(r2), support);
+                        pressure_sum.x += coeff * grad_w_ij.x;
+                        pressure_sum.y += coeff * grad_w_ij.y;
+                        pressure_sum.z += coeff * grad_w_ij.z;
+                    }
+                }
+            }
+        }
+    }
+
+    const float3 vel_adv = d_vel_adv[idx];
+    const float3 vel_new =
+        make_float3(vel_adv.x - delta_time * pressure_sum.x,
+                    vel_adv.y - delta_time * pressure_sum.y,
+                    vel_adv.z - delta_time * pressure_sum.z);
+    d_vel[idx] = vel_new;
+    d_pos_next[idx] = make_float3(pos.x + delta_time * vel_new.x,
+                                  pos.y + delta_time * vel_new.y,
+                                  pos.z + delta_time * vel_new.z);
 }

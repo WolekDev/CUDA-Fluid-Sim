@@ -19,3 +19,16 @@ FluidSimTest
 
 # IDE files
 .vscode/
+.cursor/
+.claude/
+
+# Local PDF tooling
+.pydeps/
+.tmp_get_pip.py
+
+# PDF Files
+*.pdf
+
+# Debug files
+.pydeps/
+*.py

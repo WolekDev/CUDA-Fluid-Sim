@@ -2,18 +2,21 @@
     "domain": {
         "min_x": 0.0,
         "min_y": -1.0,
+        "min_z": 0.0,
         "max_x": 10.0,
-        "max_y": 1.0
+        "max_y": 1.0,
+        "max_z": 2.0
     },
     "fluid": {
         "smoothing_radius": 0.045,
         "rest_density": 1000.0,
         "particle_mass": 0.02,
-        "viscosity": 0.01,
+        "viscosity": 0.89,
         "relaxation_factor": 0.5,
         "start_vel": [
             2.0,
-            0
+            0.0,
+            0.0
         ]
     },
     "simulation": {
@@ -21,7 +24,8 @@
         "time_step": 0.001,
         "gravity": [
             0.0,
-            -9.81
+            -9.81,
+            0.0
         ]
     },
     "solver": {

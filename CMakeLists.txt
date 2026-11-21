@@ -73,9 +73,47 @@ target_link_libraries(FluidSimTest PRIVATE
 add_dependencies(FluidSim CopyConfigs)
 add_dependencies(FluidSimTest CopyConfigs)
 
-# Enable CTest and register the test binary
+# Each test is a separate CTest target: ctest -R <name>
 enable_testing()
-add_test(NAME PipelineTestSuite COMMAND FluidSimTest)
+
+# CMake Tools launches tests with `ctest -T test`. That dashboard mode looks
+# for DartConfiguration.tcl, a leftover name from the old CTest dashboard
+# client. Writing the file here removes the missing-file notice without
+# adding the Experimental, Nightly, and Continuous targets from include(CTest).
+if(NOT DEFINED DART_TESTING_TIMEOUT)
+    set(DART_TESTING_TIMEOUT 1500)
+endif()
+if(NOT SITE)
+    site_name(SITE)
+endif()
+if(NOT BUILDNAME)
+    set(BUILDNAME "${CMAKE_SYSTEM_NAME}-${CMAKE_CXX_COMPILER_ID}")
+endif()
+configure_file(
+    ${CMAKE_ROOT}/Modules/DartConfiguration.tcl.in
+    ${CMAKE_BINARY_DIR}/DartConfiguration.tcl
+    @ONLY
+)
+set(FLUIDSIM_TESTS
+    testInitializationAndMemory
+    testSpatialHashingAndSort
+    testPoly6Kernel
+    testSpikyKernel
+    testDensityKernel
+    testAdvectionAndGradient
+    testViscosityKernel
+    testViscosityForce
+    testInitPressureSolver
+    testPressureSolve
+    testPredictedDensity
+    testIntegration
+    testPreviousPressureCopy
+)
+foreach(test_name IN LISTS FLUIDSIM_TESTS)
+    add_test(NAME ${test_name} COMMAND FluidSimTest ${test_name})
+    set_tests_properties(${test_name} PROPERTIES
+        WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+endforeach()
 
 # Ensure proper compilation flags for CUDA release builds
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
