@@ -2,6 +2,7 @@
 #include "Kernels.cuh"
 #include <cub/cub.cuh>
 #include <cub/device/device_radix_sort.cuh>
+#include <cmath>
 #include <fstream>
 #include <iostream>
 #include <nlohmann/json.hpp>
@@ -43,6 +44,10 @@ void FluidSimulation::initialize(const std::string& config_file) {
     h_density_error_threshold = data["solver"]["density_error_threshold"];
     h_max_particles = data["simulation"]["max_particles"];
     h_active_particle_count = h_max_particles; // Swap to 0 for dynamic spawning
+    h_max_boundary_particles =
+        data["simulation"].value("max_boundary_particles", 0);
+    h_boundary_particle_count = 0;
+    h_boundary_psi_dirty = false;
     h_start_vel = make_float3(data["fluid"]["start_vel"][0],
                               data["fluid"]["start_vel"][1],
                               data["fluid"]["start_vel"][2]);
@@ -120,24 +125,36 @@ void FluidSimulation::initialize(const std::string& config_file) {
     cudaMalloc(&d_sum_movement_pressure, h_max_particles * sizeof(float3));
     cudaMemset(d_sum_movement_pressure, 0, h_max_particles * sizeof(float3));
 
+    // Static boundary positions and Psi_b. Allocated with at least one entry
+    // so the kernels always receive valid pointers.
+    const int boundary_capacity = std::max(h_max_boundary_particles, 1);
+    cudaMalloc(&d_boundary_pos, boundary_capacity * sizeof(float3));
+    cudaMalloc(&d_boundary_psi, boundary_capacity * sizeof(float));
+    cudaMemset(d_boundary_pos, 0, boundary_capacity * sizeof(float3));
+    cudaMemset(d_boundary_psi, 0, boundary_capacity * sizeof(float));
+
+    // Fluid and boundary particles share the grid, so the hash buffers hold
+    // both.
+    const int hash_capacity = h_max_particles + h_max_boundary_particles;
+
     // Allocate hash key & value arrays
     cudaMalloc(&d_keys_in,
-               h_max_particles * sizeof(unsigned int)); // Keys before sorting
+               hash_capacity * sizeof(unsigned int)); // Keys before sorting
     cudaMalloc(&d_keys_out,
-               h_max_particles * sizeof(unsigned int)); // Keys after sorting
+               hash_capacity * sizeof(unsigned int)); // Keys after sorting
     cudaMalloc(&d_values_in,
-               h_max_particles * sizeof(unsigned int)); // Values before sorting
+               hash_capacity * sizeof(unsigned int)); // Values before sorting
     cudaMalloc(&d_values_out,
-               h_max_particles * sizeof(unsigned int)); // Values after sorting
+               hash_capacity * sizeof(unsigned int)); // Values after sorting
 
     // Allocate cell range lookup tables
     cudaMalloc(&d_cell_start_indices, h_max_grid_cells * sizeof(unsigned int));
     cudaMalloc(&d_cell_end_indices, h_max_grid_cells * sizeof(unsigned int));
 
-    // Pre-allocate CUB Radix sort temp storage based on max particles
+    // Pre-allocate CUB Radix sort temp storage for fluid plus boundary
     cub::DeviceRadixSort::SortPairs(nullptr, h_cub_temp_storage_bytes,
                                     d_keys_in, d_keys_out, d_values_in,
-                                    d_values_out, h_max_particles);
+                                    d_values_out, hash_capacity);
     cudaMalloc(&d_cub_temp_storage, h_cub_temp_storage_bytes);
 
     // Pre-allocate CUB Reduction temp storage and output scalar buffer for
@@ -148,38 +165,176 @@ void FluidSimulation::initialize(const std::string& config_file) {
     cudaMalloc(&d_cub_reduction_storage, h_cub_reduction_storage_bytes);
     cudaMalloc(&d_density_sum_output, sizeof(float));
 
+    // Outlet compaction buffers. Temp storage covers the float3 and float
+    // arrays that are compacted.
+    const int fluid_capacity = std::max(h_max_particles, 1);
+    cudaMalloc(&d_keep_flags, fluid_capacity * sizeof(unsigned char));
+    cudaMalloc(&d_num_selected, sizeof(int));
+    size_t select_vec_bytes = 0;
+    size_t select_scalar_bytes = 0;
+    cub::DeviceSelect::Flagged(nullptr, select_vec_bytes, d_pos, d_keep_flags,
+                               d_pos_next, d_num_selected, fluid_capacity);
+    cub::DeviceSelect::Flagged(nullptr, select_scalar_bytes, d_pressure,
+                               d_keep_flags, d_pressure_next, d_num_selected,
+                               fluid_capacity);
+    h_select_temp_storage_bytes = std::max(select_vec_bytes, select_scalar_bytes);
+    cudaMalloc(&d_select_temp_storage, h_select_temp_storage_bytes);
+
     // Set flag that all pointers are allocated
     pointers_allocated = true;
+
+    // Rest spacing from the particle volume V = m / rho_0.
+    h_fluid_spacing = std::cbrt(h_params.particle_mass / h_params.rest_density);
+    h_domain_max = make_float3(domain_max_x, domain_max_y, domain_max_z);
+    h_pipe.reset();
+    h_inflow_layer.clear();
+    h_inflow_distance = 0.0f;
+    h_capacity_warned = false;
+    if (data.contains("pipe"))
+        loadPipe(parsePipeSpec(data["pipe"]));
+}
+
+/* Builds the pipe wall as boundary particles and prepares the inlet. */
+void FluidSimulation::loadPipe(const PipeSpec& spec) {
+    const PipeWall wall = generatePipeWall(spec);
+    for (const float3& p : wall.particles) {
+        if (p.x < h_params.domain_min_x || p.x > h_domain_max.x ||
+            p.y < h_params.domain_min_y || p.y > h_domain_max.y ||
+            p.z < h_params.domain_min_z || p.z > h_domain_max.z) {
+            throw std::runtime_error(
+                "Pipe wall leaves the domain at (" + std::to_string(p.x) + ", " +
+                std::to_string(p.y) + ", " + std::to_string(p.z) +
+                "). Enlarge the domain, move the origin, or shrink the pipe.");
+        }
+    }
+    uploadBoundaryParticles(wall.particles);
+
+    h_pipe = spec;
+    if (h_pipe->inflow.zone_length <= 0.0f)
+        h_pipe->inflow.zone_length = 4.0f * h_fluid_spacing;
+
+    // Keep fluid one rest spacing from the wall particle centers.
+    const float inset = h_fluid_spacing;
+    h_inflow_layer =
+        generateCrossSection(spec, 0.5f * h_fluid_spacing, h_fluid_spacing, inset);
+    h_active_particle_count = 0;
+
+    if (spec.prefill) {
+        const PipeFill fill = generatePipeFill(spec, h_fluid_spacing, inset);
+        if (!appendFluidParticles(fill.positions, fill.velocities)) {
+            throw std::runtime_error(
+                "Prefilling the pipe needs " + std::to_string(fill.positions.size()) +
+                " fluid particles, more than max_particles.");
+        }
+    }
+}
+
+/* Appends fluid particles after the active ones. Returns false if they do
+ * not fit. */
+bool FluidSimulation::appendFluidParticles(const std::vector<float3>& positions,
+                                           const std::vector<float3>& velocities) {
+    const int count = activeFluidCount();
+    const int added = static_cast<int>(positions.size());
+    if (added == 0)
+        return true;
+    if (count + added > h_max_particles)
+        return false;
+
+    cudaMemcpy(d_pos + count, positions.data(), added * sizeof(float3),
+               cudaMemcpyHostToDevice);
+    cudaMemcpy(d_vel + count, velocities.data(), added * sizeof(float3),
+               cudaMemcpyHostToDevice);
+    cudaMemset(d_pressure_prev + count, 0, added * sizeof(float));
+    h_active_particle_count = count + added;
+    return true;
+}
+
+/* Spawns a new inlet layer each time the inlet fluid has moved one rest
+ * spacing, so emitted layers stay one spacing apart. */
+void FluidSimulation::emitInflow(float delta_time) {
+    if (!h_pipe || h_pipe->inflow.speed <= 0.0f || h_inflow_layer.empty())
+        return;
+
+    const float speed = h_pipe->inflow.speed;
+    const float3 velocity = make_float3(h_pipe->axis.x * speed,
+                                        h_pipe->axis.y * speed,
+                                        h_pipe->axis.z * speed);
+    const std::vector<float3> velocities(h_inflow_layer.size(), velocity);
+
+    h_inflow_distance += speed * delta_time;
+    while (h_inflow_distance >= h_fluid_spacing) {
+        h_inflow_distance -= h_fluid_spacing;
+        if (!appendFluidParticles(h_inflow_layer, velocities) && !h_capacity_warned) {
+            std::cerr << "Inlet paused: max_particles reached.\n";
+            h_capacity_warned = true;
+        }
+    }
+}
+
+/* Removes fluid past the outlet or outside the domain, keeping the order of
+ * the remaining particles. Scratch buffers are swapped in as the outputs. */
+void FluidSimulation::removeOutflowParticles() {
+    const int count = activeFluidCount();
+    if (!h_pipe || count <= 0)
+        return;
+
+    const int gridSize = (count + kBlockSize - 1) / kBlockSize;
+    markOutflowKernel<<<gridSize, kBlockSize>>>(
+        d_pos, d_keep_flags, count, h_pipe->origin, h_pipe->axis,
+        pipeLength(*h_pipe), h_domain_max, h_params);
+
+    const auto compact = [&](auto*& data, auto*& scratch) {
+        cub::DeviceSelect::Flagged(d_select_temp_storage,
+                                   h_select_temp_storage_bytes, data, d_keep_flags,
+                                   scratch, d_num_selected, count);
+        std::swap(data, scratch);
+    };
+    // d_pos_next, d_vel_adv, d_density_adv, and d_pressure_next are all
+    // rewritten before they are read in the next step.
+    compact(d_pos, d_pos_next);
+    compact(d_vel, d_vel_adv);
+    compact(d_density, d_density_adv);
+    compact(d_pressure, d_pressure_next);
+    compact(d_pressure_prev, d_pressure_next);
+
+    int kept = 0;
+    cudaMemcpy(&kept, d_num_selected, sizeof(int), cudaMemcpyDeviceToHost);
+    h_active_particle_count = kept;
 }
 
 /* Update function for fluid simulation. */
 void FluidSimulation::update(float delta_time) {
-    // Calculate grid size based on current particle count
-    int current_particles = std::min(h_active_particle_count, h_max_particles);
+    // New inlet layers join this step.
+    emitInflow(delta_time);
+
+    // Calculate grid size based on current fluid particle count. Boundary
+    // particles are only neighbors: they are never integrated.
+    const int current_particles = activeFluidCount();
     if (current_particles <= 0)
         return;
 
     int gridSize = (current_particles + kBlockSize - 1) / kBlockSize;
+    const BoundaryParticles boundary = boundaryView();
 
-    // Get latest spatial hashes for the particles.
+    // Get latest spatial hashes for fluid and boundary particles.
     // Sorts the keys and values using CUB Radix sort.
     updateSpatialHash();
 
-    // Compute density
+    // Compute density, including boundary contributions (Eq. (14))
     computeDensityKernel<<<gridSize, kBlockSize>>>(
-        d_values_out, d_pos, d_cell_start_indices, d_cell_end_indices,
+        d_values_out, d_pos, boundary, d_cell_start_indices, d_cell_end_indices,
         d_density, current_particles, h_params);
 
     // Compute Advection and Gradient
     computeAdvectionAndGradientKernel<<<gridSize, kBlockSize>>>(
-        d_pos, d_vel, nullptr, d_vel_adv, d_density, d_grad_coup_vect,
+        d_pos, boundary, d_vel, nullptr, d_vel_adv, d_density, d_grad_coup_vect,
         d_values_out, d_cell_start_indices, d_cell_end_indices,
         current_particles, h_params, delta_time);
 
     // Initialize Pressure Solver
     // Calculates density adv, initial pressure, and a_ii
     initPressureSolverKernel<<<gridSize, kBlockSize>>>(
-        d_pos, d_vel_adv, d_density, d_density_adv, d_grad_coup_vect,
+        d_pos, boundary, d_vel_adv, d_density, d_density_adv, d_grad_coup_vect,
         d_values_out, d_cell_start_indices, d_cell_end_indices, d_pressure,
         d_pressure_prev, d_diag_coeff, current_particles, h_params, delta_time);
 
@@ -198,7 +353,7 @@ void FluidSimulation::update(float delta_time) {
 
         // Update pressure into a separate buffer so every particle reads p^l.
         updatePressureKernel<<<gridSize, kBlockSize>>>(
-            d_pos, d_density, d_density_adv, d_diag_coeff, d_pressure,
+            d_pos, boundary, d_density, d_density_adv, d_diag_coeff, d_pressure,
             d_pressure_next, d_values_out, d_cell_start_indices,
             d_cell_end_indices, d_sum_movement_pressure, d_grad_coup_vect,
             current_particles, h_params, delta_time);
@@ -207,12 +362,12 @@ void FluidSimulation::update(float delta_time) {
 
         // Update density from the pressure assigned for this iteration.
         updateDensityKernel<<<gridSize, kBlockSize>>>(
-            d_pos, d_density, d_density_adv, d_diag_coeff, d_pressure,
+            d_pos, boundary, d_density, d_density_adv, d_diag_coeff, d_pressure,
             d_density_predicted, d_values_out, d_cell_start_indices,
             d_cell_end_indices, d_sum_movement_pressure, d_grad_coup_vect,
             current_particles, h_params, delta_time);
 
-        // Compute average predicted density via CUB parallel reduction
+        // Compute average predicted fluid density via CUB parallel reduction
         cub::DeviceReduce::Sum(
             d_cub_reduction_storage, h_cub_reduction_storage_bytes,
             d_density_predicted, d_density_sum_output, current_particles);
@@ -226,18 +381,31 @@ void FluidSimulation::update(float delta_time) {
     }
 
     // v(t+dt) = v_adv + dt * F_pressure / m, then x(t+dt) = x + dt * v(t+dt).
-    // Thesis p. 14, Eq. (4.12) and Algorithm 1 lines 21–22.
+    // Thesis p. 14, Eq. (4.12), Ihmsen Eq. (15), and Algorithm 1 lines 21–22.
+    // Only fluid positions are swapped; boundary positions stay fixed.
     integrateKernel<<<gridSize, kBlockSize>>>(
-        d_pos, d_pos_next, d_vel, d_vel_adv, d_density, d_pressure, d_values_out,
-        d_cell_start_indices, d_cell_end_indices, current_particles, h_params,
-        delta_time);
+        d_pos, boundary, d_pos_next, d_vel, d_vel_adv, d_density, d_pressure,
+        d_values_out, d_cell_start_indices, d_cell_end_indices,
+        current_particles, h_params, delta_time);
     float3* integrated_positions = d_pos;
     d_pos = d_pos_next;
     d_pos_next = integrated_positions;
 
+    // Pipe inlet: fluid that started in the zone moves at the inflow speed.
+    // d_pos_next now holds the positions from before integration.
+    if (h_pipe && h_pipe->inflow.speed > 0.0f) {
+        applyInflowKernel<<<gridSize, kBlockSize>>>(
+            d_pos, d_pos_next, d_vel, current_particles, h_pipe->origin,
+            h_pipe->axis, h_pipe->inflow.zone_length, h_pipe->inflow.speed,
+            delta_time);
+    }
+
     // Save current pressure as previous pressure for the next frame
     cudaMemcpy(d_pressure_prev, d_pressure, h_max_particles * sizeof(float),
                cudaMemcpyDeviceToDevice);
+
+    // Pipe outlet: drop fluid that has left the pipe or the domain.
+    removeOutflowParticles();
 
     // Check if an error occurred while launching the kernel
     cudaError_t err = cudaGetLastError();
@@ -247,28 +415,32 @@ void FluidSimulation::update(float delta_time) {
     }
 }
 
-/* Get new spatial hashes for the particles. */
+/* Get new spatial hashes for fluid and boundary particles. */
 void FluidSimulation::updateSpatialHash() {
 
-    // Calculate grid size based on current particle count
-    int current_particles = std::min(h_active_particle_count, h_max_particles);
-    if (current_particles <= 0)
+    // Fluid particles use ids [0, fluid) and boundary particles
+    // [fluid, fluid + boundary), so one sorted grid serves both.
+    const int fluid_particles = activeFluidCount();
+    const int boundary_particles = h_boundary_particle_count;
+    const int total_particles = fluid_particles + boundary_particles;
+    if (total_particles <= 0)
         return;
 
-    int gridSize = (current_particles + kBlockSize - 1) / kBlockSize;
+    int gridSize = (total_particles + kBlockSize - 1) / kBlockSize;
 
     // Compute hash for each particle. Updates keys and values arrays.
     // This gets two arrays. One for keys, which are the cell codes of each
-    // particle. The other for values, which are the index numbers.
-    computeHashKernel<<<gridSize, kBlockSize>>>(d_pos, d_keys_in, d_values_in,
-                                                current_particles, h_params);
+    // particle. The other for values, which are the particle ids.
+    computeHashKernel<<<gridSize, kBlockSize>>>(
+        d_pos, d_boundary_pos, d_keys_in, d_values_in, fluid_particles,
+        boundary_particles, h_params);
 
     // Sort using CUB Radix sort. This ensures that the key value pairs
     // stay together after sort. End goal is to have all identical cell
     // keys grouped together.
     cub::DeviceRadixSort::SortPairs(
         d_cub_temp_storage, h_cub_temp_storage_bytes, d_keys_in, d_keys_out,
-        d_values_in, d_values_out, current_particles);
+        d_values_in, d_values_out, total_particles);
 
     // Clear values in index arrays
     cudaMemset(d_cell_start_indices, 0xFF,
@@ -278,8 +450,41 @@ void FluidSimulation::updateSpatialHash() {
 
     // Get new start and end index for each cell.
     findCellRangesKernel<<<gridSize, kBlockSize>>>(
-        d_keys_out, d_cell_start_indices, d_cell_end_indices,
-        current_particles);
+        d_keys_out, d_cell_start_indices, d_cell_end_indices, total_particles);
+
+    // Boundary particles are static, so Psi_b only changes when they are
+    // re-uploaded. Ihmsen et al., p. 5, Section 4.
+    if (h_boundary_psi_dirty && boundary_particles > 0) {
+        const int boundaryGrid = (boundary_particles + kBlockSize - 1) / kBlockSize;
+        computeBoundaryPsiKernel<<<boundaryGrid, kBlockSize>>>(
+            d_boundary_pos, d_boundary_psi, d_values_out, d_cell_start_indices,
+            d_cell_end_indices, fluid_particles, boundary_particles, h_params);
+    }
+    h_boundary_psi_dirty = false;
+}
+
+/* Replaces the static boundary particles. */
+void FluidSimulation::uploadBoundaryParticles(
+    const std::vector<float3>& positions) {
+    if (positions.size() > static_cast<size_t>(h_max_boundary_particles)) {
+        throw std::runtime_error(
+            "Boundary particle count exceeds max_boundary_particles defined in "
+            "config.");
+    }
+
+    h_boundary_particle_count = static_cast<int>(positions.size());
+    h_boundary_psi_dirty = true;
+    if (positions.empty())
+        return;
+
+    cudaError_t err =
+        cudaMemcpy(d_boundary_pos, positions.data(),
+                   positions.size() * sizeof(float3), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        throw std::runtime_error(
+            std::string("Failed to upload boundary particles: ") +
+            cudaGetErrorString(err));
+    }
 }
 
 /* Deallocate pointers before finishing program. */
@@ -300,6 +505,11 @@ void FluidSimulation::cleanup() {
     cudaFree(d_grad_coup_vect);
     cudaFree(d_diag_coeff);
     cudaFree(d_sum_movement_pressure);
+    cudaFree(d_boundary_pos);
+    cudaFree(d_boundary_psi);
+    cudaFree(d_keep_flags);
+    cudaFree(d_num_selected);
+    cudaFree(d_select_temp_storage);
     cudaFree(d_keys_in);
     cudaFree(d_keys_out);
     cudaFree(d_values_in);
@@ -315,6 +525,15 @@ void FluidSimulation::cleanup() {
     d_density = d_density_adv = d_density_predicted = nullptr;
     d_pressure = d_pressure_prev = d_pressure_next = d_diag_coeff = nullptr;
     d_sum_movement_pressure = nullptr;
+    d_boundary_pos = nullptr;
+    d_boundary_psi = nullptr;
+    h_boundary_particle_count = 0;
+    h_boundary_psi_dirty = false;
+    d_keep_flags = nullptr;
+    d_num_selected = nullptr;
+    d_select_temp_storage = nullptr;
+    h_pipe.reset();
+    h_inflow_layer.clear();
     d_keys_in = d_keys_out = d_values_in = d_values_out = nullptr;
     d_cell_start_indices = d_cell_end_indices = nullptr;
     d_cub_temp_storage = d_cub_reduction_storage = nullptr;
@@ -362,11 +581,14 @@ void FluidSimulation::uploadTestVelocities(const std::vector<float3>& velocities
     }
 }
 
-/* Debug function: Copies keys array from device to host. */
+/* Debug function: Copies the sorted keys of fluid and boundary particles. */
 std::vector<unsigned int> FluidSimulation::copyKeysToHost() {
-    std::vector<unsigned int> host_keys(h_max_particles);
+    const int total = activeFluidCount() + h_boundary_particle_count;
+    std::vector<unsigned int> host_keys(total);
+    if (total == 0)
+        return host_keys;
     cudaError_t err = cudaMemcpy(host_keys.data(), d_keys_out,
-                                 h_max_particles * sizeof(unsigned int),
+                                 total * sizeof(unsigned int),
                                  cudaMemcpyDeviceToHost);
     if (err != cudaSuccess) {
         throw std::runtime_error(std::string("Failed to copy keys to host: ") +
@@ -485,4 +707,26 @@ std::vector<float> FluidSimulation::copyPrevPressureToHost() const {
                    current_particles * sizeof(float), cudaMemcpyDeviceToHost);
     }
     return h_prev_pressure;
+}
+
+/* Debug function: Copies the static boundary positions from device to host. */
+std::vector<float3> FluidSimulation::copyBoundaryPositionsToHost() const {
+    std::vector<float3> h_boundary_pos(h_boundary_particle_count);
+    if (h_boundary_particle_count > 0 && d_boundary_pos) {
+        cudaMemcpy(h_boundary_pos.data(), d_boundary_pos,
+                   h_boundary_particle_count * sizeof(float3),
+                   cudaMemcpyDeviceToHost);
+    }
+    return h_boundary_pos;
+}
+
+/* Debug function: Copies Psi_b(rho_0) from device to host. */
+std::vector<float> FluidSimulation::copyBoundaryPsiToHost() const {
+    std::vector<float> h_boundary_psi(h_boundary_particle_count);
+    if (h_boundary_particle_count > 0 && d_boundary_psi) {
+        cudaMemcpy(h_boundary_psi.data(), d_boundary_psi,
+                   h_boundary_particle_count * sizeof(float),
+                   cudaMemcpyDeviceToHost);
+    }
+    return h_boundary_psi;
 }

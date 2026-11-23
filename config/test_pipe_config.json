@@ -1,0 +1,52 @@
+{
+    "solver": {
+        "max_iterations": 5,
+        "density_error_threshold": 0.1
+    },
+    "simulation": {
+        "max_particles": 5000,
+        "max_boundary_particles": 5000,
+        "time_step": 0.005,
+        "gravity": [
+            0.0,
+            -9.81,
+            0.0
+        ]
+    },
+    "fluid": {
+        "start_vel": [
+            0.0,
+            0.0,
+            0.0
+        ],
+        "smoothing_radius": 0.04,
+        "rest_density": 1000.0,
+        "particle_mass": 0.02,
+        "viscosity": 0.89,
+        "relaxation_factor": 0.5
+    },
+    "domain": {
+        "min_x": 0.0,
+        "min_y": 0.0,
+        "min_z": 0.0,
+        "max_x": 1.0,
+        "max_y": 1.0,
+        "max_z": 1.0
+    },
+    "pipe": {
+        "shape": "circle",
+        "origin": [0.1, 0.5, 0.5],
+        "axis": [1.0, 0.0, 0.0],
+        "wall_spacing": 0.02,
+        "wall_layers": 2,
+        "segments": [
+            {"length": 0.3, "start_area": 0.02},
+            {"length": 0.2, "start_area": 0.02, "end_area": 0.008, "ramp": "cosine"},
+            {"length": 0.2, "start_area": 0.008}
+        ],
+        "inflow": {
+            "speed": 0.5
+        },
+        "prefill": false
+    }
+}

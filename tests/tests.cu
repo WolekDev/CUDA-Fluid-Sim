@@ -88,10 +88,11 @@ struct ReferenceState {
     std::vector<float> diag;
     std::vector<float3> position;
     std::vector<float3> velocity;
+    std::vector<float> boundary_psi;
 };
 
 /* Same 3x3x3 cell walk as the kernels, with particles kept in index order.
- * That matches a stable sort of (cell key, particle index). */
+ * That matches a stable sort of (cell key, particle id). */
 template <typename Visitor>
 void forNeighbors(const std::vector<float3>& pos, const SimulationParams& params,
                   const std::vector<std::vector<int>>& cells, int particle,
@@ -143,20 +144,33 @@ float3 pairwiseDji(float3 grad_w_ji, float mass, float density_i, float dt2) {
                        scale * grad_w_ji.z);
 }
 
-/* Host transcription of one IISPH step.
- * Density: Ihmsen p. 2. Advection and d_ii: Algorithm 1, p. 3.
- * rho_adv: Eq. (4). a_ii: Eq. (12). d_ji: thesis Eq. (4.11).
- * Pressure: Eq. (13) / thesis Eq. (4.8). Density prediction: thesis Eq. (4.7). */
+float3 difference3(float3 a, float3 b) {
+    return make_float3(a.x - b.x, a.y - b.y, a.z - b.z);
+}
+
+/* Host transcription of one IISPH step with static boundary particles.
+ * Fluid particle i has id i, and boundary particle b has id count + b.
+ * Psi_b and boundary density: Ihmsen p. 5, Eq. (14). Density: Ihmsen p. 2.
+ * Advection and d_ii: Algorithm 1, p. 3, and p. 6. rho_adv: Eq. (4) and p. 6.
+ * a_ii: Eq. (12) plus the p. 6 boundary term. d_ji: thesis Eq. (4.11).
+ * Pressure: Eq. (16). Density prediction: thesis Eq. (4.7) plus p. 6.
+ * Integration: Eq. (4.12), Eq. (15), and Algorithm 1 lines 21–22. */
 ReferenceState solveReference(const std::vector<float3>& pos,
                               const SimulationParams& params, float dt,
                               int max_iterations, float density_threshold,
-                              const std::vector<float3>& initial_velocity = {}) {
+                              const std::vector<float3>& initial_velocity = {},
+                              const std::vector<float3>& boundary = {}) {
     const int count = static_cast<int>(pos.size());
+    const int boundary_count = static_cast<int>(boundary.size());
     const float support = params.smoothing_radius;
     const float support2 = support * support;
     const float mass = params.particle_mass;
     const float dt2 = dt * dt;
-    const auto cells = buildCells(pos, params);
+
+    std::vector<float3> all = pos;
+    all.insert(all.end(), boundary.begin(), boundary.end());
+    const auto cells = buildCells(all, params);
+    const auto is_boundary = [count](int id) { return id >= count; };
 
     ReferenceState state;
     state.density.assign(count, 0.0f);
@@ -167,6 +181,7 @@ ReferenceState solveReference(const std::vector<float3>& pos,
     state.pressure.assign(count, 0.0f);
     state.density_predicted.assign(count, 0.0f);
     state.sum_movement.assign(count, make_float3(0.0f, 0.0f, 0.0f));
+    state.boundary_psi.assign(boundary_count, 0.0f);
     std::vector<float> pressure_prev(count, 0.0f);
     std::vector<float3> vel(count, make_float3(0.0f, 0.0f, 0.0f));
     if (!initial_velocity.empty()) {
@@ -175,13 +190,29 @@ ReferenceState solveReference(const std::vector<float3>& pos,
         vel = initial_velocity;
     }
 
+    // delta_b = sum_{b_j} W_{b b_j}, Psi_b = rho_0 / delta_b. Ihmsen p. 5.
+    for (int b = 0; b < boundary_count; ++b) {
+        float delta = 0.0f;
+        forNeighbors(all, params, cells, count + b, [&](int j) {
+            if (!is_boundary(j))
+                return;
+            const float3 r = difference3(all[count + b], all[j]);
+            const float r2 = dot3(r, r);
+            if (r2 <= support2)
+                delta += computePoly6(std::sqrt(r2), support);
+        });
+        state.boundary_psi[b] = params.rest_density / delta;
+    }
+    const auto weight_of = [&](int id) {
+        return is_boundary(id) ? state.boundary_psi[id - count] : mass;
+    };
+
     for (int i = 0; i < count; ++i) {
-        forNeighbors(pos, params, cells, i, [&](int j) {
-            const float3 rij = make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                           pos[i].z - pos[j].z);
+        forNeighbors(all, params, cells, i, [&](int j) {
+            const float3 rij = difference3(all[i], all[j]);
             const float r2 = dot3(rij, rij);
             if (r2 <= support2)
-                state.density[i] += mass * computePoly6(std::sqrt(r2), support);
+                state.density[i] += weight_of(j) * computePoly6(std::sqrt(r2), support);
         });
     }
 
@@ -189,15 +220,13 @@ ReferenceState solveReference(const std::vector<float3>& pos,
         float3 accumulated = make_float3(0.0f, 0.0f, 0.0f);
         float3 f_visc = make_float3(0.0f, 0.0f, 0.0f);
         if (state.density[i] > 0.0f) {
-            const float scale = mass / (state.density[i] * state.density[i]);
+            const float inv_density2 = 1.0f / (state.density[i] * state.density[i]);
             const float mass_over_density = mass / state.density[i];
             const float visc_scale =
                 mass_over_density * mass_over_density *
                 dynamicViscosityPascalSeconds(params.viscosity);
-            forNeighbors(pos, params, cells, i, [&](int j) {
-                const float3 rij =
-                    make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                pos[i].z - pos[j].z);
+            forNeighbors(all, params, cells, i, [&](int j) {
+                const float3 rij = difference3(all[i], all[j]);
                 const float r2 = dot3(rij, rij);
                 if (r2 >= support2)
                     return;
@@ -205,10 +234,13 @@ ReferenceState solveReference(const std::vector<float3>& pos,
                 if (distance > 0.0f) {
                     const float3 grad =
                         computeSpikyGradient(rij, distance, support);
+                    const float scale = weight_of(j) * inv_density2;
                     accumulated.x += scale * grad.x;
                     accumulated.y += scale * grad.y;
                     accumulated.z += scale * grad.z;
                 }
+                if (is_boundary(j))
+                    return;
                 const float coeff = visc_scale * computeViscosity(distance, support);
                 f_visc.x += -(vel[i].x - vel[j].x) * coeff;
                 f_visc.y += -(vel[i].y - vel[j].y) * coeff;
@@ -229,34 +261,74 @@ ReferenceState solveReference(const std::vector<float3>& pos,
         float density_sum = 0.0f;
         float a_ii = 0.0f;
         if (state.density[i] > 0.0f) {
-            forNeighbors(pos, params, cells, i, [&](int j) {
-                const float3 rij =
-                    make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                pos[i].z - pos[j].z);
+            forNeighbors(all, params, cells, i, [&](int j) {
+                const float3 rij = difference3(all[i], all[j]);
                 const float r2 = dot3(rij, rij);
                 if (r2 <= 0.0f || r2 >= support2)
                     return;
                 const float distance = std::sqrt(r2);
                 const float3 grad_ij =
                     computeSpikyGradient(rij, distance, support);
+                if (is_boundary(j)) {
+                    // p. 6: Psi_b (v_i^adv - 0) · grad W_ib and Psi_b d_ii · grad W_ib
+                    const float psi = state.boundary_psi[j - count];
+                    density_sum += psi * dot3(state.vel_adv[i], grad_ij);
+                    a_ii += psi * dot3(state.dii[i], grad_ij);
+                    return;
+                }
                 const float3 grad_ji = computeSpikyGradient(
                     make_float3(-rij.x, -rij.y, -rij.z), distance, support);
-                const float3 relative = make_float3(
-                    state.vel_adv[i].x - state.vel_adv[j].x,
-                    state.vel_adv[i].y - state.vel_adv[j].y,
-                    state.vel_adv[i].z - state.vel_adv[j].z);
-                density_sum += mass * dot3(relative, grad_ij);
+                density_sum +=
+                    mass * dot3(difference3(state.vel_adv[i], state.vel_adv[j]),
+                                grad_ij);
                 const float3 d_ji =
                     pairwiseDji(grad_ji, mass, state.density[i], dt2);
-                const float3 difference =
-                    make_float3(state.dii[i].x - d_ji.x, state.dii[i].y - d_ji.y,
-                                state.dii[i].z - d_ji.z);
-                a_ii += mass * dot3(difference, grad_ij);
+                a_ii += mass * dot3(difference3(state.dii[i], d_ji), grad_ij);
             });
         }
         state.density_adv[i] = state.density[i] + dt * density_sum;
         state.diag[i] = a_ii;
     }
+
+    // Eq. (16) neighbor terms: fluid part from Eq. (13), boundary part p. 6.
+    const auto neighbor_term = [&](int i) {
+        float neighbor_sum = 0.0f;
+        if (state.density[i] <= 0.0f)
+            return neighbor_sum;
+        forNeighbors(all, params, cells, i, [&](int j) {
+            const float3 rij = difference3(all[i], all[j]);
+            const float r2 = dot3(rij, rij);
+            if (is_boundary(j)) {
+                if (r2 <= 0.0f || r2 >= support2)
+                    return;
+                const float3 grad_ib =
+                    computeSpikyGradient(rij, std::sqrt(r2), support);
+                neighbor_sum += state.boundary_psi[j - count] *
+                                dot3(state.sum_movement[i], grad_ib);
+                return;
+            }
+            if (j == i || r2 <= 0.0f || r2 >= support2)
+                return;
+            const float distance = std::sqrt(r2);
+            const float3 grad_ij = computeSpikyGradient(rij, distance, support);
+            const float3 grad_ji = computeSpikyGradient(
+                make_float3(-rij.x, -rij.y, -rij.z), distance, support);
+            const float3 d_ji = pairwiseDji(grad_ji, mass, state.density[i], dt2);
+            const float3 excluded = make_float3(
+                state.sum_movement[j].x - d_ji.x * state.pressure[i],
+                state.sum_movement[j].y - d_ji.y * state.pressure[i],
+                state.sum_movement[j].z - d_ji.z * state.pressure[i]);
+            const float3 inner = make_float3(
+                state.sum_movement[i].x - state.dii[j].x * state.pressure[j] -
+                    excluded.x,
+                state.sum_movement[i].y - state.dii[j].y * state.pressure[j] -
+                    excluded.y,
+                state.sum_movement[i].z - state.dii[j].z * state.pressure[j] -
+                    excluded.z);
+            neighbor_sum += mass * dot3(inner, grad_ij);
+        });
+        return neighbor_sum;
+    };
 
     int iteration = 0;
     float density_average = 0.0f;
@@ -265,10 +337,10 @@ ReferenceState solveReference(const std::vector<float3>& pos,
            iteration < max_iterations) {
         for (int i = 0; i < count; ++i) {
             float3 sum = make_float3(0.0f, 0.0f, 0.0f);
-            forNeighbors(pos, params, cells, i, [&](int j) {
-                const float3 rij =
-                    make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                pos[i].z - pos[j].z);
+            forNeighbors(all, params, cells, i, [&](int j) {
+                if (is_boundary(j))
+                    return;
+                const float3 rij = difference3(all[i], all[j]);
                 const float r2 = dot3(rij, rij);
                 if (r2 <= 0.0f || r2 >= support2 || state.density[j] <= 0.0f)
                     return;
@@ -285,38 +357,7 @@ ReferenceState solveReference(const std::vector<float3>& pos,
 
         std::vector<float> pressure_next = state.pressure;
         for (int i = 0; i < count; ++i) {
-            float neighbor_sum = 0.0f;
-            if (state.density[i] > 0.0f) {
-                forNeighbors(pos, params, cells, i, [&](int j) {
-                    if (j == i)
-                        return;
-                    const float3 rij =
-                        make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                    pos[i].z - pos[j].z);
-                    const float r2 = dot3(rij, rij);
-                    if (r2 <= 0.0f || r2 >= support2)
-                        return;
-                    const float distance = std::sqrt(r2);
-                    const float3 grad_ij =
-                        computeSpikyGradient(rij, distance, support);
-                    const float3 grad_ji = computeSpikyGradient(
-                        make_float3(-rij.x, -rij.y, -rij.z), distance, support);
-                    const float3 d_ji =
-                        pairwiseDji(grad_ji, mass, state.density[i], dt2);
-                    const float3 excluded = make_float3(
-                        state.sum_movement[j].x - d_ji.x * state.pressure[i],
-                        state.sum_movement[j].y - d_ji.y * state.pressure[i],
-                        state.sum_movement[j].z - d_ji.z * state.pressure[i]);
-                    const float3 inner = make_float3(
-                        state.sum_movement[i].x - state.dii[j].x * state.pressure[j] -
-                            excluded.x,
-                        state.sum_movement[i].y - state.dii[j].y * state.pressure[j] -
-                            excluded.y,
-                        state.sum_movement[i].z - state.dii[j].z * state.pressure[j] -
-                            excluded.z);
-                    neighbor_sum += mass * dot3(inner, grad_ij);
-                });
-            }
+            const float neighbor_sum = neighbor_term(i);
             float updated = state.pressure[i];
             if (state.diag[i] > 1.0e-12f || state.diag[i] < -1.0e-12f) {
                 updated = (1.0f - params.relaxation_factor) * state.pressure[i] +
@@ -331,66 +372,37 @@ ReferenceState solveReference(const std::vector<float3>& pos,
 
         float density_sum = 0.0f;
         for (int i = 0; i < count; ++i) {
-            float neighbor_sum = 0.0f;
-            if (state.density[i] > 0.0f) {
-                forNeighbors(pos, params, cells, i, [&](int j) {
-                    if (j == i)
-                        return;
-                    const float3 rij =
-                        make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                    pos[i].z - pos[j].z);
-                    const float r2 = dot3(rij, rij);
-                    if (r2 <= 0.0f || r2 >= support2)
-                        return;
-                    const float distance = std::sqrt(r2);
-                    const float3 grad_ij =
-                        computeSpikyGradient(rij, distance, support);
-                    const float3 grad_ji = computeSpikyGradient(
-                        make_float3(-rij.x, -rij.y, -rij.z), distance, support);
-                    const float3 d_ji =
-                        pairwiseDji(grad_ji, mass, state.density[i], dt2);
-                    const float3 excluded = make_float3(
-                        state.sum_movement[j].x - d_ji.x * state.pressure[i],
-                        state.sum_movement[j].y - d_ji.y * state.pressure[i],
-                        state.sum_movement[j].z - d_ji.z * state.pressure[i]);
-                    const float3 inner = make_float3(
-                        state.sum_movement[i].x - state.dii[j].x * state.pressure[j] -
-                            excluded.x,
-                        state.sum_movement[i].y - state.dii[j].y * state.pressure[j] -
-                            excluded.y,
-                        state.sum_movement[i].z - state.dii[j].z * state.pressure[j] -
-                            excluded.z);
-                    neighbor_sum += mass * dot3(inner, grad_ij);
-                });
-            }
-            state.density_predicted[i] =
-                state.density_adv[i] + state.diag[i] * state.pressure[i] +
-                neighbor_sum;
+            state.density_predicted[i] = state.density_adv[i] +
+                                         state.diag[i] * state.pressure[i] +
+                                         neighbor_term(i);
             density_sum += state.density_predicted[i];
         }
         density_average = density_sum / static_cast<float>(count);
         ++iteration;
     }
 
-    // Eq. (4.12) / Ihmsen Eq. (2), then Algorithm 1 lines 21–22.
     state.position.resize(count);
     state.velocity.resize(count);
     for (int i = 0; i < count; ++i) {
         float3 pressure_sum = make_float3(0.0f, 0.0f, 0.0f);
         if (state.density[i] > 0.0f) {
-            const float inv_density_i2 =
-                1.0f / (state.density[i] * state.density[i]);
-            forNeighbors(pos, params, cells, i, [&](int j) {
-                const float3 rij =
-                    make_float3(pos[i].x - pos[j].x, pos[i].y - pos[j].y,
-                                pos[i].z - pos[j].z);
+            const float pressure_term_i =
+                state.pressure[i] / (state.density[i] * state.density[i]);
+            forNeighbors(all, params, cells, i, [&](int j) {
+                const float3 rij = difference3(all[i], all[j]);
                 const float r2 = dot3(rij, rij);
-                if (r2 <= 0.0f || r2 >= support2 || state.density[j] <= 0.0f)
+                if (r2 <= 0.0f || r2 >= support2)
                     return;
-                const float coeff =
-                    mass * (state.pressure[i] * inv_density_i2 +
-                            state.pressure[j] /
-                                (state.density[j] * state.density[j]));
+                float coeff = 0.0f;
+                if (is_boundary(j)) {
+                    coeff = state.boundary_psi[j - count] * pressure_term_i;
+                } else {
+                    if (state.density[j] <= 0.0f)
+                        return;
+                    coeff = mass * (pressure_term_i +
+                                    state.pressure[j] /
+                                        (state.density[j] * state.density[j]));
+                }
                 const float3 grad =
                     computeSpikyGradient(rij, std::sqrt(r2), support);
                 pressure_sum.x += coeff * grad.x;
@@ -418,6 +430,83 @@ std::vector<float3> sampleParticles() {
     return {make_float3(0.50f, 0.50f, 0.50f), make_float3(0.51f, 0.50f, 0.50f),
             make_float3(0.90f, 0.90f, 0.90f)};
 }
+
+/* Square wall of static boundary particles in the plane y = height, centered
+ * at x = z = 0.5, like the open-top box walls of the thesis scenes (p. 29). */
+std::vector<float3> boundaryFloor(int per_side, float spacing, float height) {
+    std::vector<float3> floor;
+    const float offset = 0.5f * static_cast<float>(per_side - 1) * spacing;
+    for (int ix = 0; ix < per_side; ++ix)
+        for (int iz = 0; iz < per_side; ++iz)
+            floor.push_back(make_float3(0.5f - offset + ix * spacing, height,
+                                        0.5f - offset + iz * spacing));
+    return floor;
+}
+
+constexpr float kFloorHeight = 0.5f;
+constexpr float kFloorSpacing = 0.02f;
+
+std::vector<float3> wallFloor() {
+    return boundaryFloor(11, kFloorSpacing, kFloorHeight);
+}
+
+/* Particles 0 and 1 interact with each other and with the floor. Particle 2
+ * is isolated. Particle 3 touches only the floor. */
+std::vector<float3> fluidNearWall() {
+    return {make_float3(0.50f, 0.52f, 0.50f), make_float3(0.51f, 0.525f, 0.505f),
+            make_float3(0.90f, 0.90f, 0.90f), make_float3(0.56f, 0.51f, 0.56f)};
+}
+
+/* Particles 0 and 1 move toward the floor together, so only boundary terms
+ * change their advected density. */
+std::vector<float3> fluidNearWallVelocities() {
+    return {make_float3(0.0f, -0.5f, 0.0f), make_float3(0.0f, -0.5f, 0.0f),
+            make_float3(0.0f, 0.0f, 0.0f), make_float3(0.0f, 0.0f, 0.0f)};
+}
+
+/* Brute-force Psi_b = rho_0 / sum_{b_j} W_{b b_j}, Ihmsen p. 5, in double. */
+std::vector<double> psiReference(const std::vector<float3>& boundary,
+                                 double rest_density, double support) {
+    std::vector<double> psi;
+    for (const float3& b : boundary) {
+        double delta = 0.0;
+        for (const float3& other : boundary) {
+            const double dx = b.x - other.x;
+            const double dy = b.y - other.y;
+            const double dz = b.z - other.z;
+            delta += poly6Reference(std::sqrt(dx * dx + dy * dy + dz * dz), support);
+        }
+        psi.push_back(rest_density / delta);
+    }
+    return psi;
+}
+
+double distance3(float3 a, float3 b) {
+    const double dx = a.x - b.x;
+    const double dy = a.y - b.y;
+    const double dz = a.z - b.z;
+    return std::sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+/* One boundary step on the GPU, plus the matching host reference. */
+struct BoundaryStep {
+    std::vector<float3> fluid = fluidNearWall();
+    std::vector<float3> velocities = fluidNearWallVelocities();
+    std::vector<float3> boundary = wallFloor();
+    float dt = 0.005f;
+    ReferenceState expected;
+
+    void run(FluidSimulation& sim) {
+        sim.initialize(kConfig);
+        sim.uploadTestParticles(fluid);
+        sim.uploadTestVelocities(velocities);
+        sim.uploadBoundaryParticles(boundary);
+        sim.update(dt);
+        expected = solveReference(fluid, sim.getParams(), dt, sim.getMaxIterations(),
+                                  sim.getDensityErrorThreshold(), velocities,
+                                  boundary);
+    }
+};
 
 } // namespace
 
@@ -809,6 +898,576 @@ void testPreviousPressureCopy() {
     std::cout << "[Pass] end-of-step pressure is copied to the previous buffer\n";
 }
 
+void testBoundaryUpload() {
+    std::cout << "\n[TEST] testBoundaryUpload\n";
+    FluidSimulation sim;
+    sim.initialize(kConfig);
+    expect(sim.getMaxBoundaryParticles() == 1000,
+           "max_boundary_particles was not loaded");
+    expect(sim.getBoundaryParticleCount() == 0,
+           "a new simulation should start without boundary particles");
+
+    const auto floor = wallFloor();
+    sim.uploadBoundaryParticles(floor);
+    expect(sim.getBoundaryParticleCount() == static_cast<int>(floor.size()),
+           "boundary count does not match the upload");
+    const auto stored = sim.copyBoundaryPositionsToHost();
+    for (size_t b = 0; b < floor.size(); ++b)
+        expectNear3(stored[b], floor[b], "boundary position " + std::to_string(b));
+
+    bool threw = false;
+    try {
+        sim.uploadBoundaryParticles(
+            std::vector<float3>(sim.getMaxBoundaryParticles() + 1,
+                                make_float3(0.5f, 0.5f, 0.5f)));
+    } catch (const std::runtime_error&) {
+        threw = true;
+    }
+    expect(threw, "uploading more than max_boundary_particles should throw");
+
+    // Fluid and boundary share one sorted grid.
+    sim.uploadBoundaryParticles(floor);
+    sim.uploadTestParticles(fluidNearWall());
+    sim.updateSpatialHash();
+    const auto keys = sim.copyKeysToHost();
+    expect(keys.size() == fluidNearWall().size() + floor.size(),
+           "the grid should hold fluid and boundary particles");
+    for (size_t i = 0; i + 1 < keys.size(); ++i)
+        expect(keys[i] <= keys[i + 1], "combined cell keys are not sorted");
+    sim.cleanup();
+    std::cout << "[Pass] boundary particles upload and share the fluid grid\n";
+}
+
+void testBoundaryPsi() {
+    std::cout << "\n[TEST] testBoundaryPsi\n";
+    FluidSimulation sim;
+    sim.initialize(kConfig);
+    auto boundary = wallFloor();
+    boundary.push_back(make_float3(0.1f, 0.1f, 0.1f)); // isolated
+    sim.uploadTestParticles(fluidNearWall());
+    sim.uploadBoundaryParticles(boundary);
+    sim.updateSpatialHash();
+
+    const SimulationParams& params = sim.getParams();
+    const auto psi = sim.copyBoundaryPsiToHost();
+    const auto expected =
+        psiReference(boundary, params.rest_density, params.smoothing_radius);
+    expect(psi.size() == boundary.size(), "Psi_b buffer has the wrong size");
+    for (size_t b = 0; b < boundary.size(); ++b)
+        expectNear(psi[b], static_cast<float>(expected[b]),
+                   "Psi_b " + std::to_string(b));
+
+    const size_t corner = 0;
+    const size_t center = 5 * 11 + 5;
+    expect(psi[center] < psi[corner],
+           "a densely sampled wall particle should get a smaller Psi_b");
+    expectNear(psi.back(),
+               static_cast<float>(params.rest_density /
+                                  poly6Reference(0.0, params.smoothing_radius)),
+               "an isolated boundary particle has delta_b = W(0)");
+    sim.cleanup();
+    std::cout << "[Pass] Psi_b = rho_0 / delta_b matches Ihmsen p. 5\n";
+}
+
+void testBoundaryDensity() {
+    std::cout << "\n[TEST] testBoundaryDensity\n";
+    FluidSimulation sim;
+    BoundaryStep step;
+    step.run(sim);
+
+    const SimulationParams& params = sim.getParams();
+    const double support = params.smoothing_radius;
+    const double mass = params.particle_mass;
+    const auto psi = psiReference(step.boundary, params.rest_density, support);
+    const auto density = sim.copyDensitiesToHost();
+
+    // Brute-force Eq. (14), first line.
+    for (size_t i = 0; i < step.fluid.size(); ++i) {
+        double rho = 0.0;
+        for (const float3& other : step.fluid)
+            rho += mass * poly6Reference(distance3(step.fluid[i], other), support);
+        for (size_t b = 0; b < step.boundary.size(); ++b)
+            rho += psi[b] *
+                   poly6Reference(distance3(step.fluid[i], step.boundary[b]), support);
+        expectNear(density[i], static_cast<float>(rho),
+                   "boundary density " + std::to_string(i));
+        expectNear(density[i], step.expected.density[i],
+                   "reference density " + std::to_string(i));
+    }
+
+    const float lone = static_cast<float>(mass * poly6Reference(0.0, support));
+    expectNear(density[2], lone, "the isolated particle sees no boundary");
+    expect(density[3] > lone,
+           "a particle next to the wall should gain density from it");
+    expect(density[3] > params.rest_density,
+           "the wall alone should push particle 3 over the rest density");
+    sim.cleanup();
+    std::cout << "[Pass] density includes sum_b Psi_b W_ib (Eq. (14))\n";
+}
+
+void testBoundaryAdvectionAndDiagonal() {
+    std::cout << "\n[TEST] testBoundaryAdvectionAndDiagonal\n";
+    FluidSimulation sim;
+    BoundaryStep step;
+    step.run(sim);
+
+    const auto vel_adv = sim.copyVelAdvToHost();
+    const auto dii = sim.copyGradCoupToHost();
+    const auto density = sim.copyDensitiesToHost();
+    const auto density_adv = sim.copyDensityAdvToHost();
+    const auto diag = sim.copyDiagCoeffToHost();
+    for (size_t i = 0; i < step.fluid.size(); ++i) {
+        const std::string id = std::to_string(i);
+        expectNear3(vel_adv[i], step.expected.vel_adv[i], "advected velocity " + id);
+        expectNear3(dii[i], step.expected.dii[i], "boundary d_ii " + id);
+        expectNear(density_adv[i], step.expected.density_adv[i],
+                   "boundary rho_adv " + id);
+        expectNear(diag[i], step.expected.diag[i], "boundary a_ii " + id);
+    }
+
+    expect(dii[3].y > 0.0f,
+           "the wall's d_ii term should displace particle 3 away from the wall");
+    expect(density_adv[0] > density[0] && density_adv[1] > density[1],
+           "moving toward a static wall should raise rho_adv (v_b = 0)");
+    expect(diag[3] != 0.0f,
+           "a particle touching only the wall should still get a_ii != 0");
+    expect(diag[2] == 0.0f, "the isolated particle should keep a_ii = 0");
+    sim.cleanup();
+    std::cout << "[Pass] d_ii, rho_adv, and a_ii include the p. 6 boundary terms\n";
+}
+
+void testBoundaryPressureSolve() {
+    std::cout << "\n[TEST] testBoundaryPressureSolve\n";
+    FluidSimulation sim;
+    BoundaryStep step;
+    step.run(sim);
+
+    const auto pressure = sim.copyPressureToHost();
+    const auto predicted = sim.copyPredictedDensitiesToHost();
+    for (size_t i = 0; i < step.fluid.size(); ++i) {
+        const std::string id = std::to_string(i);
+        expect(pressure[i] >= 0.0f, "pressure was not clamped at 0");
+        expectNear(pressure[i], step.expected.pressure[i], "Eq. (16) pressure " + id);
+        expectNear(predicted[i], step.expected.density_predicted[i],
+                   "predicted density " + id);
+    }
+    expect(pressure[3] > 0.0f,
+           "the wall alone should give particle 3 a positive pressure");
+    expect(pressure[2] == 0.0f, "the isolated particle should keep zero pressure");
+    sim.cleanup();
+    std::cout << "[Pass] relaxed Jacobi pressure matches Eq. (16)\n";
+}
+
+void testBoundaryIntegration() {
+    std::cout << "\n[TEST] testBoundaryIntegration\n";
+    FluidSimulation sim;
+    BoundaryStep step;
+    step.run(sim);
+
+    const auto position = sim.copyPositionsToHost();
+    const auto velocity = sim.copyVelocitiesToHost();
+    for (size_t i = 0; i < step.fluid.size(); ++i) {
+        const std::string id = std::to_string(i);
+        expectNear3(position[i], step.expected.position[i], "position " + id);
+        expectNear3(velocity[i], step.expected.velocity[i], "velocity " + id);
+    }
+
+    const SimulationParams& params = sim.getParams();
+    expect(velocity[3].y > step.dt * params.gravity_vector.y,
+           "Eq. (15) should push particle 3 away from the wall");
+
+    const auto boundary = sim.copyBoundaryPositionsToHost();
+    for (size_t b = 0; b < step.boundary.size(); ++b) {
+        expect(boundary[b].x == step.boundary[b].x &&
+                   boundary[b].y == step.boundary[b].y &&
+                   boundary[b].z == step.boundary[b].z,
+               "boundary particle " + std::to_string(b) + " moved");
+    }
+    sim.cleanup();
+    std::cout << "[Pass] integration applies Eq. (15) and keeps boundaries fixed\n";
+}
+
+void testBoundaryContainment() {
+    std::cout << "\n[TEST] testBoundaryContainment\n";
+    FluidSimulation sim;
+    sim.initialize(kConfig);
+    const auto floor = boundaryFloor(21, kFloorSpacing, kFloorHeight);
+    sim.uploadBoundaryParticles(floor);
+    sim.uploadTestParticles({make_float3(0.5f, kFloorHeight + 0.06f, 0.5f)});
+
+    const float dt = 0.002f;
+    float lowest = 1.0f;
+    for (int step = 0; step < 400; ++step) {
+        sim.update(dt);
+        lowest = std::min(lowest, sim.copyPositionsToHost()[0].y);
+    }
+
+    const float3 final_position = sim.copyPositionsToHost()[0];
+    expect(lowest > kFloorHeight,
+           "the fluid particle passed through the boundary wall, lowest y=" +
+               std::to_string(lowest));
+    expect(final_position.y < kFloorHeight + 0.06f,
+           "the particle should have fallen toward the wall");
+    const auto boundary = sim.copyBoundaryPositionsToHost();
+    expect(std::equal(floor.begin(), floor.end(), boundary.begin(),
+                      [](float3 a, float3 b) {
+                          return a.x == b.x && a.y == b.y && a.z == b.z;
+                      }),
+           "boundary particles moved during the simulation");
+    std::cout << "  lowest y=" << lowest << ", final y=" << final_position.y << "\n";
+    sim.cleanup();
+    std::cout << "[Pass] a falling particle rests on the boundary wall\n";
+}
+
+namespace {
+
+const char* kPipeConfig = "config/test_pipe_config.json";
+
+/* Straight pipe along +x through (0.5, 0.5, 0.5). For that axis the
+ * cross-section frame is u = -z and w = +y. */
+PipeSpec straightPipe(PipeShape shape, int sides, float area, float length) {
+    PipeSpec spec;
+    spec.shape = shape;
+    spec.sides = sides;
+    spec.origin = make_float3(0.5f, 0.5f, 0.5f);
+    spec.axis = make_float3(1.0f, 0.0f, 0.0f);
+    spec.wall_spacing = 0.02f;
+    spec.wall_layers = 2;
+    spec.segments.push_back({length, area, area, PipeRamp::Linear});
+    return spec;
+}
+
+struct Local {
+    double s, x, y;
+};
+
+Local localCoordinates(const PipeSpec& spec, float3 p) {
+    return {p.x - spec.origin.x, -(p.z - spec.origin.z), p.y - spec.origin.y};
+}
+
+double areaFactorReference(const PipeSpec& spec) {
+    if (spec.shape == PipeShape::Circle)
+        return M_PI;
+    return 0.5 * spec.sides * std::sin(2.0 * M_PI / spec.sides);
+}
+
+/* Largest edge-normal projection. Equals the apothem on a polygon outline. */
+double polygonSupport(const PipeSpec& spec, double x, double y) {
+    double support = -1.0e30;
+    for (int i = 0; i < spec.sides; ++i) {
+        const double phi = -0.5 * M_PI + 2.0 * M_PI * i / spec.sides;
+        support = std::max(support, x * std::cos(phi) + y * std::sin(phi));
+    }
+    return support;
+}
+
+} // namespace
+
+void testPipeConfigParse() {
+    std::cout << "\n[TEST] testPipeConfigParse\n";
+    const auto config = nlohmann::json::parse(R"({
+        "shape": "square", "rotation_deg": 90.0,
+        "origin": [0.1, 0.2, 0.3], "axis": [2.0, 0.0, 0.0],
+        "wall_spacing": 0.02,
+        "segments": [
+            {"length": 0.5, "start_area": 0.04},
+            {"length": 0.25, "start_area": 0.04, "end_area": 0.01, "ramp": "cosine"}
+        ],
+        "inflow": {"speed": 1.5, "zone_length": 0.2},
+        "prefill": true
+    })");
+    const PipeSpec spec = parsePipeSpec(config);
+    expect(spec.shape == PipeShape::RegularPolygon && spec.sides == 4,
+           "square should parse as a 4-sided polygon");
+    expectNear(spec.rotation_radians, static_cast<float>(M_PI / 2.0), "rotation_deg");
+    expectNear3(spec.axis, make_float3(1.0f, 0.0f, 0.0f), "axis is normalized");
+    expect(spec.wall_layers == 2, "wall_layers should default to 2");
+    expect(spec.segments.size() == 2, "segment count");
+    expectNear(spec.segments[0].end_area, 0.04f, "end_area defaults to start_area");
+    expect(spec.segments[1].ramp == PipeRamp::Cosine, "ramp should parse");
+    expectNear(spec.inflow.speed, 1.5f, "inflow speed");
+    expect(spec.prefill, "prefill should parse");
+    expectNear(pipeLength(spec), 0.75f, "pipe length is the sum of segments");
+
+    const auto throws = [](const char* text) {
+        try {
+            parsePipeSpec(nlohmann::json::parse(text));
+        } catch (const std::runtime_error&) {
+            return true;
+        }
+        return false;
+    };
+    expect(throws(R"({"shape": "star", "origin": [0,0,0], "wall_spacing": 0.02,
+                      "segments": [{"length": 1, "start_area": 1}]})"),
+           "unknown shapes should be rejected");
+    expect(throws(R"({"shape": "polygon", "sides": 2, "origin": [0,0,0],
+                      "wall_spacing": 0.02,
+                      "segments": [{"length": 1, "start_area": 1}]})"),
+           "polygons need at least 3 sides");
+    expect(throws(R"({"origin": [0,0,0], "wall_spacing": 0.02,
+                      "segments": [{"length": 1, "start_area": -1}]})"),
+           "negative areas should be rejected");
+    std::cout << "[Pass] pipe config parses and validates\n";
+}
+
+void testPipeCircleWall() {
+    std::cout << "\n[TEST] testPipeCircleWall\n";
+    const PipeSpec spec = straightPipe(PipeShape::Circle, 0, 0.02f, 0.2f);
+    const PipeWall wall = generatePipeWall(spec);
+    const double radius = std::sqrt(0.02 / M_PI);
+    const double spacing = spec.wall_spacing;
+
+    expect(wall.ring_positions.size() == 11, "a 0.2 m pipe needs 11 rings at 0.02 m");
+    for (size_t k = 0; k + 1 < wall.ring_positions.size(); ++k)
+        expectNear(wall.ring_positions[k + 1] - wall.ring_positions[k], 0.02f, "ring spacing");
+
+    const int per_ring = static_cast<int>(std::ceil(2.0 * M_PI * radius / spacing));
+    int inner = 0;
+    for (const float3& p : wall.particles) {
+        const Local l = localCoordinates(spec, p);
+        const double r = std::sqrt(l.x * l.x + l.y * l.y);
+        const bool on_inner = std::fabs(r - radius) < 1.0e-5;
+        const bool on_outer = std::fabs(r - (radius + spacing)) < 1.0e-5;
+        expect(on_inner || on_outer, "wall particle is not on a layer circle");
+        expect(l.s >= -1.0e-6 && l.s <= 0.2 + 1.0e-6, "wall particle off the pipe");
+        inner += on_inner ? 1 : 0;
+    }
+    expect(inner == per_ring * static_cast<int>(wall.ring_positions.size()),
+           "each inner ring should have ceil(2 pi R / spacing) points");
+    expectNear(pipeAreaAt(spec, 0.1f), 0.02f, "area should match the request");
+    std::cout << "[Pass] circular wall rings are spaced by wall_spacing\n";
+}
+
+void testPipePolygonWall() {
+    std::cout << "\n[TEST] testPipePolygonWall\n";
+    for (int sides : {3, 4, 6}) {
+        const std::string name = std::to_string(sides) + "-gon ";
+        const PipeSpec spec =
+            straightPipe(PipeShape::RegularPolygon, sides, 0.02f, 0.1f);
+        const PipeWall wall = generatePipeWall(spec);
+        const double radius = std::sqrt(0.02 / areaFactorReference(spec));
+        const double apothem = radius * std::cos(M_PI / sides);
+
+        for (const float3& p : wall.particles) {
+            const Local l = localCoordinates(spec, p);
+            const double support = polygonSupport(spec, l.x, l.y);
+            expect(std::fabs(support - apothem) < 1.0e-5 ||
+                       std::fabs(support - apothem - spec.wall_spacing) < 1.0e-5,
+                   name + "wall particle is not on a layer outline");
+        }
+
+        // Every corner of the inner outline is sampled.
+        for (int i = 0; i < sides; ++i) {
+            const double theta = -0.5 * M_PI - M_PI / sides + 2.0 * M_PI * i / sides;
+            const double cx = radius * std::cos(theta);
+            const double cy = radius * std::sin(theta);
+            bool found = false;
+            for (const float3& p : wall.particles) {
+                const Local l = localCoordinates(spec, p);
+                found = found || (std::fabs(l.s) < 1.0e-6 &&
+                                  std::hypot(l.x - cx, l.y - cy) < 1.0e-5);
+            }
+            expect(found, name + "corner " + std::to_string(i) + " is missing");
+        }
+
+        // rotation 0 puts a flat side at the bottom (-w).
+        int bottom = 0;
+        for (const float3& p : wall.particles) {
+            const Local l = localCoordinates(spec, p);
+            bottom += std::fabs(l.s) < 1.0e-6 && std::fabs(l.y + apothem) < 1.0e-5;
+        }
+        expect(bottom >= 2, name + "should have a flat bottom side");
+        expectNear(pipeAreaAt(spec, 0.05f), 0.02f, name + "area");
+    }
+    std::cout << "[Pass] polygon walls follow the outline and keep corners\n";
+}
+
+void testPipeTaperSpacing() {
+    std::cout << "\n[TEST] testPipeTaperSpacing\n";
+    PipeSpec spec = straightPipe(PipeShape::Circle, 0, 0.02f, 0.1f);
+    spec.segments.push_back({0.2f, 0.02f, 0.005f, PipeRamp::Linear});
+    const PipeWall wall = generatePipeWall(spec);
+
+    expectNear(wall.ring_positions.front(), 0.0f, "first ring at the inlet");
+    expectNear(wall.ring_positions.back(), 0.3f, "last ring at the outlet");
+    bool has_joint = false;
+    for (size_t k = 0; k + 1 < wall.ring_positions.size(); ++k) {
+        expect(wall.ring_positions[k + 1] > wall.ring_positions[k] + 1.0e-6,
+               "rings must not repeat at a segment joint");
+        has_joint = has_joint || std::fabs(wall.ring_positions[k] - 0.1f) < 1.0e-6;
+
+        // Distance between rings measured along the sloped wall.
+        const double ds = wall.ring_positions[k + 1] - wall.ring_positions[k];
+        const double dr = pipeCircumradiusAt(spec, wall.ring_positions[k + 1]) -
+                          pipeCircumradiusAt(spec, wall.ring_positions[k]);
+        const double along_wall = std::sqrt(ds * ds + dr * dr);
+        expect(along_wall <= spec.wall_spacing + 1.0e-5,
+               "rings are further apart than wall_spacing along the taper");
+        expect(along_wall >= 0.5 * spec.wall_spacing,
+               "rings are much closer than wall_spacing");
+    }
+    expect(has_joint, "the joint between segments needs a ring");
+    expectNear(pipeCircumradiusAt(spec, 0.3f),
+               static_cast<float>(std::sqrt(0.005 / M_PI)), "outlet radius");
+    expectNear(pipeAreaAt(spec, 0.3f), 0.005f, "outlet area");
+
+    PipeSpec cosine = spec;
+    cosine.segments[1].ramp = PipeRamp::Cosine;
+    const float joint_slope =
+        (pipeCircumradiusAt(cosine, 0.1001f) - pipeCircumradiusAt(cosine, 0.1f)) /
+        0.0001f;
+    expect(std::fabs(joint_slope) < 1.0e-2f,
+           "a cosine ramp should start with zero slope");
+    std::cout << "[Pass] taper rings are wall_spacing apart along the wall\n";
+}
+
+void testPipeCrossSectionFill() {
+    std::cout << "\n[TEST] testPipeCrossSectionFill\n";
+    // Square with area 0.04 has apothem 0.1. Inset 0.03 keeps |x|, |y| <= 0.07,
+    // so a 0.02 lattice gives 7 x 7 points.
+    const PipeSpec square =
+        straightPipe(PipeShape::RegularPolygon, 4, 0.04f, 0.5f);
+    const auto layer = generateCrossSection(square, 0.25f, 0.02f, 0.03f);
+    expect(layer.size() == 49, "square cross-section should hold 7 x 7 points, got " +
+                                   std::to_string(layer.size()));
+    for (const float3& p : layer) {
+        const Local l = localCoordinates(square, p);
+        expectNear(static_cast<float>(l.s), 0.25f, "fill point off its station");
+        expect(polygonSupport(square, l.x, l.y) <= 0.07 + 1.0e-6,
+               "fill point inside the inset");
+    }
+
+    PipeSpec venturi = straightPipe(PipeShape::Circle, 0, 0.04f, 0.2f);
+    venturi.segments.push_back({0.2f, 0.04f, 0.01f, PipeRamp::Cosine});
+    venturi.inflow.speed = 1.0f;
+    const float spacing = 0.02f;
+    const float inset = 0.02f;
+    const PipeFill fill = generatePipeFill(venturi, spacing, inset);
+    expect(!fill.positions.empty(), "fill should not be empty");
+    for (size_t i = 0; i < fill.positions.size(); ++i) {
+        const Local l = localCoordinates(venturi, fill.positions[i]);
+        const double radius = pipeCircumradiusAt(venturi, static_cast<float>(l.s));
+        expect(std::hypot(l.x, l.y) <= radius - inset + 1.0e-6,
+               "fill point too close to the wall");
+        // Continuity: v(s) = v_in A(0) / A(s).
+        const float expected = 0.04f / pipeAreaAt(venturi, static_cast<float>(l.s));
+        expectNear(fill.velocities[i].x, expected, "continuity speed");
+        expect(fill.velocities[i].y == 0.0f && fill.velocities[i].z == 0.0f,
+               "fill velocity should be along the axis");
+    }
+    std::cout << "[Pass] cross-section fill stays inside and obeys continuity\n";
+}
+
+void testPipeConfigLoading() {
+    std::cout << "\n[TEST] testPipeConfigLoading\n";
+    FluidSimulation sim;
+    sim.initialize(kPipeConfig);
+    const PipeSpec* spec = sim.getPipe();
+    expect(spec != nullptr, "the pipe block was not loaded");
+    expect(sim.getBoundaryParticleCount() ==
+               static_cast<int>(generatePipeWall(*spec).particles.size()),
+           "the pipe wall should be uploaded as boundary particles");
+    expect(sim.getActiveParticleCount() == 0,
+           "without prefill the pipe should start empty");
+    expectNear(sim.getFluidSpacing(), std::cbrt(0.02f / 1000.0f),
+               "rest spacing is cbrt(m / rho_0)");
+    expectNear(spec->inflow.zone_length, 4.0f * sim.getFluidSpacing(),
+               "zone_length should default to four rest spacings");
+    expect(sim.getInflowLayerSize() == 9,
+           "the inlet layer should hold 3 x 3 points, got " +
+               std::to_string(sim.getInflowLayerSize()));
+
+    sim.updateSpatialHash();
+    const auto psi = sim.copyBoundaryPsiToHost();
+    expect(std::all_of(psi.begin(), psi.end(), [](float v) { return v > 0.0f; }),
+           "Psi_b should be computed for every pipe wall particle");
+    sim.cleanup();
+    std::cout << "[Pass] the pipe config builds the wall and the inlet\n";
+}
+
+void testPipeInflowEmission() {
+    std::cout << "\n[TEST] testPipeInflowEmission\n";
+    FluidSimulation sim;
+    sim.initialize(kPipeConfig);
+    const PipeSpec& spec = *sim.getPipe();
+    const int layer = sim.getInflowLayerSize();
+    const float dt = 0.005f;
+    const int steps_per_layer = static_cast<int>(
+        std::ceil(sim.getFluidSpacing() / (spec.inflow.speed * dt)));
+
+    for (int step = 1; step < steps_per_layer; ++step) {
+        sim.update(dt);
+        expect(sim.getActiveParticleCount() == 0,
+               "a layer was emitted before the inlet moved one spacing");
+    }
+    sim.update(dt);
+    expect(sim.getActiveParticleCount() == layer,
+           "one layer should be emitted after one rest spacing of inflow");
+    for (int step = 0; step < steps_per_layer; ++step)
+        sim.update(dt);
+    expect(sim.getActiveParticleCount() == 2 * layer,
+           "a second layer should follow one spacing later");
+    sim.cleanup();
+    std::cout << "[Pass] the inlet emits one layer per rest spacing\n";
+}
+
+void testPipeInflowZone() {
+    std::cout << "\n[TEST] testPipeInflowZone\n";
+    FluidSimulation sim;
+    sim.initialize(kPipeConfig);
+    const PipeSpec& spec = *sim.getPipe();
+    const int layer = sim.getInflowLayerSize();
+    const float dt = 0.005f;
+    for (int step = 0; step < 25; ++step)
+        sim.update(dt);
+
+    const auto positions = sim.copyPositionsToHost();
+    const auto velocities = sim.copyVelocitiesToHost();
+    expect(static_cast<int>(positions.size()) == 2 * layer, "expected two layers");
+    for (size_t i = 0; i < positions.size(); ++i) {
+        const float s = pipeAxialCoordinate(spec, positions[i]);
+        expect(s < spec.inflow.zone_length, "fluid left the zone too early");
+        expectNear3(velocities[i], make_float3(spec.inflow.speed, 0.0f, 0.0f),
+                    "zone velocity " + std::to_string(i));
+    }
+
+    const float first = pipeAxialCoordinate(spec, positions[0]);
+    const float second = pipeAxialCoordinate(spec, positions[layer]);
+    expect(std::fabs((first - second) - sim.getFluidSpacing()) <=
+               spec.inflow.speed * dt + 1.0e-5f,
+           "inlet layers should stay one rest spacing apart");
+    sim.cleanup();
+    std::cout << "[Pass] fluid in the inlet zone moves at the inflow speed\n";
+}
+
+void testPipeOutflowRemoval() {
+    std::cout << "\n[TEST] testPipeOutflowRemoval\n";
+    FluidSimulation sim;
+    sim.initialize(kPipeConfig);
+    // Pipe runs from x = 0.1 to x = 0.8 along y = z = 0.5.
+    const std::vector<float3> particles = {
+        make_float3(0.40f, 0.5f, 0.5f),  // inside
+        make_float3(0.85f, 0.5f, 0.5f),  // past the outlet
+        make_float3(0.46f, 0.5f, 0.5f),  // inside
+        make_float3(0.50f, 1.20f, 0.5f), // outside the domain
+    };
+    sim.uploadTestParticles(particles);
+    sim.update(0.001f);
+
+    expect(sim.getActiveParticleCount() == 2,
+           "particles past the outlet or outside the domain should be removed");
+    const auto positions = sim.copyPositionsToHost();
+    expect(std::fabs(positions[0].x - 0.40f) < 0.01f &&
+               std::fabs(positions[1].x - 0.46f) < 0.01f,
+           "remaining particles should keep their order");
+    expect(sim.copyPressureToHost().size() == 2 &&
+               sim.copyPrevPressureToHost().size() == 2 &&
+               sim.copyVelocitiesToHost().size() == 2,
+           "per-particle buffers should shrink with the count");
+    sim.cleanup();
+    std::cout << "[Pass] the outlet removes fluid and compacts the buffers\n";
+}
+
 int main(int argc, char** argv) {
     const std::pair<const char*, void (*)()> tests[] = {
         {"testInitializationAndMemory", testInitializationAndMemory},
@@ -824,6 +1483,22 @@ int main(int argc, char** argv) {
         {"testPredictedDensity", testPredictedDensity},
         {"testIntegration", testIntegration},
         {"testPreviousPressureCopy", testPreviousPressureCopy},
+        {"testBoundaryUpload", testBoundaryUpload},
+        {"testBoundaryPsi", testBoundaryPsi},
+        {"testBoundaryDensity", testBoundaryDensity},
+        {"testBoundaryAdvectionAndDiagonal", testBoundaryAdvectionAndDiagonal},
+        {"testBoundaryPressureSolve", testBoundaryPressureSolve},
+        {"testBoundaryIntegration", testBoundaryIntegration},
+        {"testBoundaryContainment", testBoundaryContainment},
+        {"testPipeConfigParse", testPipeConfigParse},
+        {"testPipeCircleWall", testPipeCircleWall},
+        {"testPipePolygonWall", testPipePolygonWall},
+        {"testPipeTaperSpacing", testPipeTaperSpacing},
+        {"testPipeCrossSectionFill", testPipeCrossSectionFill},
+        {"testPipeConfigLoading", testPipeConfigLoading},
+        {"testPipeInflowEmission", testPipeInflowEmission},
+        {"testPipeInflowZone", testPipeInflowZone},
+        {"testPipeOutflowRemoval", testPipeOutflowRemoval},
     };
 
     try {

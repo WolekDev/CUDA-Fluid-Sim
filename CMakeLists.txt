@@ -47,6 +47,7 @@ add_executable(FluidSim
     src/main.cpp
     src/FluidSimulation.cu
     src/Kernels.cu
+    src/PipeGenerator.cpp
     libraries/glad/src/glad.c
 )
 
@@ -62,6 +63,7 @@ add_executable(FluidSimTest
     tests/tests.cu
     src/FluidSimulation.cu
     src/Kernels.cu
+    src/PipeGenerator.cpp
 )
 
 target_link_libraries(FluidSimTest PRIVATE 
@@ -108,6 +110,22 @@ set(FLUIDSIM_TESTS
     testPredictedDensity
     testIntegration
     testPreviousPressureCopy
+    testBoundaryUpload
+    testBoundaryPsi
+    testBoundaryDensity
+    testBoundaryAdvectionAndDiagonal
+    testBoundaryPressureSolve
+    testBoundaryIntegration
+    testBoundaryContainment
+    testPipeConfigParse
+    testPipeCircleWall
+    testPipePolygonWall
+    testPipeTaperSpacing
+    testPipeCrossSectionFill
+    testPipeConfigLoading
+    testPipeInflowEmission
+    testPipeInflowZone
+    testPipeOutflowRemoval
 )
 foreach(test_name IN LISTS FLUIDSIM_TESTS)
     add_test(NAME ${test_name} COMMAND FluidSimTest ${test_name})

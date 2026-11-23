@@ -88,11 +88,27 @@ __host__ __device__ inline float3 computeSpikyGradient(float3 r_ij, float distan
     return make_float3(r_ij.x * weight, r_ij.y * weight, r_ij.z * weight);
 }
 
-/* Compute hashes for the particles. Store in key value arrays. */
+/* Static boundary particles b. Ihmsen et al., p. 5, Section 4, using the
+ * rigid-fluid coupling of Akinci et al. [29]. They have fixed positions and act
+ * as walls (thesis p. 15). They have no mass, velocity, or pressure of their own
+ * (Ihmsen p. 6, above Eq. (15)). Their contribution is weighted by
+ * Psi_b(rho_0) = rho_0 / delta_b, with delta_b = sum_{b_j} W_{b b_j} (p. 5).
+ * The fluid and boundary share one grid. Fluid particle i has id i, and
+ * boundary particle b has id num_fluid + b. */
+struct BoundaryParticles {
+    const float3* positions = nullptr; // x_b
+    const float* psi = nullptr;        // Psi_b(rho_0)
+};
+
+/* Compute hashes for fluid and boundary particles. Store in key value arrays.
+ * Fluid particles get ids [0, num_fluid), and boundary particles get
+ * [num_fluid, num_fluid + num_boundary). */
 __global__ void computeHashKernel(const float3* __restrict__ d_pos,
+                                  const float3* __restrict__ d_boundary_pos,
                                   unsigned int* __restrict__ d_keys,
                                   unsigned int* __restrict__ d_values,
-                                  int num_particles, SimulationParams params);
+                                  int num_fluid, int num_boundary,
+                                  SimulationParams params);
 
 /* Find start and end indexes of each cell. */
 __global__ void
@@ -101,16 +117,27 @@ findCellRangesKernel(const unsigned int* __restrict__ d_sorted_keys,
                      unsigned int* __restrict__ d_cell_end_indices,
                      int num_particles);
 
+/* Boundary contribution weight.
+ * delta_b = sum_{b_j} W_{b b_j}, over boundary neighbors only, self included.
+ * Psi_b(rho_0) = rho_0 / delta_b
+ * Ihmsen et al., p. 5, Section 4. W is thesis p. 10, Eq. (4.1). */
+__global__ void computeBoundaryPsiKernel(
+    const float3* __restrict__ d_boundary_pos, float* __restrict__ d_boundary_psi,
+    const unsigned int* __restrict__ d_sorted_values,
+    const unsigned int* __restrict__ d_cell_start_indices,
+    const unsigned int* __restrict__ d_cell_end_indices, int num_fluid,
+    int num_boundary, SimulationParams params);
+
 /* Compute density for SPH.
- * rho_i(t) = sum_j m_j W_ij(t).
- * Ihmsen et al., p. 2 and Algorithm 1; thesis p. 8, Algorithm 1 line 3.
- * W_ij is Eq. (4.1). */
+ * rho_i(t) = sum_j m_j W_ij + sum_b Psi_b(rho_0) W_ib
+ * Ihmsen et al., p. 2 and p. 5, first line of Eq. (14);
+ * thesis p. 8, Algorithm 1 line 3. W_ij is Eq. (4.1). */
 __global__ void
 computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
-                     const float3* __restrict__ d_pos,
+                     const float3* __restrict__ d_pos, BoundaryParticles boundary,
                      const unsigned int* __restrict__ d_cell_start_indices,
                      const unsigned int* __restrict__ d_cell_end_indices,
-                     float* __restrict__ d_density, int num_particles,
+                     float* __restrict__ d_density, int num_fluid,
                      SimulationParams params);
 
 /* Computes velocity advection and the displacement factor d_ii.
@@ -118,78 +145,90 @@ computeDensityKernel(const unsigned int* __restrict__ d_sorted_values,
  * F_i^visc = -sum_j (v_i - v_j) (m_j / rho_i)^2 * mu * W_viscosity
  *   Thesis p. 11, Eq. (4.4). W_viscosity is Eq. (4.3).
  *   mu is the dynamic viscosity in Pa·s, from the configured mPa·s value.
+ *   The sum runs over fluid neighbors j.
  * v_i^adv = v_i + dt * F_i^adv / m_i
- * d_ii = dt^2 * sum_j -m_j / rho_i^2 * grad W_ij
- * Ihmsen et al., p. 3, Algorithm 1; thesis pp. 8 and 11. */
+ * d_ii = -dt^2 sum_j m_j / rho_i^2 grad W_ij - dt^2 sum_b Psi_b / rho_i^2 grad W_ib
+ *   Ihmsen et al., p. 3, Algorithm 1, extended by p. 6 (d_ii under Eq. (15));
+ *   thesis pp. 8 and 11. */
 __global__ void computeAdvectionAndGradientKernel(
-    const float3* __restrict__ d_pos, const float3* __restrict__ d_vel,
-    const float3* __restrict__ d_force_ext, float3* __restrict__ d_vel_adv,
-    const float* __restrict__ d_density, float3* __restrict__ d_grad_coup_vect,
+    const float3* __restrict__ d_pos, BoundaryParticles boundary,
+    const float3* __restrict__ d_vel, const float3* __restrict__ d_force_ext,
+    float3* __restrict__ d_vel_adv, const float* __restrict__ d_density,
+    float3* __restrict__ d_grad_coup_vect,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
-    const unsigned int* __restrict__ d_cell_end_indices, int num_particles,
+    const unsigned int* __restrict__ d_cell_end_indices, int num_fluid,
     SimulationParams params, float delta_time);
 
 /* Initialize pressure solver. Calculates density advection, initial pressure,
  * and the diagonal coefficient a_ii.
- * rho_i^adv = rho_i + dt * sum_j m_j (v_i^adv - v_j^adv) · grad W_ij
- *   Ihmsen et al., p. 2, Eq. (4); thesis p. 8, Algorithm 1 line 7.
+ * rho_i^adv = rho_i + dt sum_j m_j (v_i^adv - v_j^adv) · grad W_ij
+ *           + dt sum_b Psi_b (v_i^adv - v_b) · grad W_ib
+ *   Ihmsen et al., p. 2, Eq. (4), extended on p. 6 (rho_i^adv after Eq. (14)).
+ *   Static boundaries have v_b = 0 (thesis p. 15).
  * p_i^0 = 0.5 * p_i(t - dt)
  *   Ihmsen et al., p. 4; thesis p. 12.
- * a_ii = sum_j m_j (d_ii - d_ji) · grad W_ij
- *   Ihmsen et al., p. 4, Eq. (12); thesis p. 12, Eq. (4.5).
+ * a_ii = sum_j m_j (d_ii - d_ji) · grad W_ij + sum_b Psi_b d_ii · grad W_ib
+ *   Fluid part: Ihmsen et al., p. 4, Eq. (12); thesis p. 12, Eq. (4.5).
+ *   Boundary part: the p_i coefficient of the density correction on p. 6,
+ *   sum_b Psi_b (dt^2 F_i^p / m_i) · grad W_ib with dt^2 F_i^p / m_i =
+ *   d_ii p_i + sum_j d_ij p_j. The remaining sum_j d_ij p_j part is the
+ *   boundary term of Eq. (16).
  * d_ji = -dt^2 * (m_i / rho_i^2) * grad W_ji
  *   thesis p. 13, Eq. (4.11), consistent with Ihmsen Eq. (9). */
 __global__ void initPressureSolverKernel(
-    const float3* __restrict__ d_pos, const float3* __restrict__ d_vel_adv,
-    const float* __restrict__ d_density, float* __restrict__ d_density_adv,
-    const float3* __restrict__ d_grad_coup_vect,
+    const float3* __restrict__ d_pos, BoundaryParticles boundary,
+    const float3* __restrict__ d_vel_adv, const float* __restrict__ d_density,
+    float* __restrict__ d_density_adv, const float3* __restrict__ d_grad_coup_vect,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
     float* __restrict__ d_pressure, const float* __restrict__ d_pressure_prev,
-    float* __restrict__ d_diag_coeff, int num_particles,
-    SimulationParams params, float delta_time);
+    float* __restrict__ d_diag_coeff, int num_fluid, SimulationParams params,
+    float delta_time);
 
 /* Sum of pressure displacements, sum_j d_ij p_j^l.
  * sum_j d_ij p_j^l = dt^2 * sum_j -m_j / rho_j^2 * p_j^l * grad W_ij
- * Ihmsen et al., p. 3, Algorithm 1; thesis p. 8 line 14 and p. 12. */
+ * Ihmsen et al., p. 3, Algorithm 1; thesis p. 8 line 14 and p. 12.
+ * Only fluid j: boundary particles have no pressure (Ihmsen p. 6). */
 __global__ void calculateSumMovementFromPressureKernel(
     const float3* __restrict__ d_pos, const float* __restrict__ d_density,
     const float* __restrict__ d_pressure,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
-    float3* __restrict__ d_sum_movement_pressure, int num_particles,
+    float3* __restrict__ d_sum_movement_pressure, int num_fluid,
     SimulationParams params, float delta_time);
 
 /* Relaxed Jacobi pressure update. Writes p^{l+1} without reading the
  * in-progress output, so every particle uses the same p^l.
  * p_i^{l+1} = (1 - omega) p_i^l + (omega / a_ii) *
  *   (rho_0 - rho_i^adv - sum_j m_j (sum_j d_ij p_j^l - d_jj p_j^l
- *   - sum_{k != i} d_jk p_k^l) · grad W_ij)
- * Ihmsen et al., p. 4, Eq. (13); thesis p. 13, Eq. (4.8).
+ *   - sum_{k != i} d_jk p_k^l) · grad W_ij
+ *   - sum_b Psi_b (sum_j d_ij p_j^l) · grad W_ib)
+ * Ihmsen et al., p. 6, Eq. (16), which is Eq. (13) (p. 4) / thesis
+ * Eq. (4.8) plus the boundary term.
  * Negative results are clamped to 0. Ihmsen et al., p. 4; thesis p. 14. */
 __global__ void updatePressureKernel(
-    const float3* __restrict__ d_pos, const float* __restrict__ d_density,
-    const float* __restrict__ d_density_adv,
+    const float3* __restrict__ d_pos, BoundaryParticles boundary,
+    const float* __restrict__ d_density, const float* __restrict__ d_density_adv,
     const float* __restrict__ d_diag_coeff,
     const float* __restrict__ d_pressure, float* __restrict__ d_pressure_next,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
     const unsigned int* __restrict__ d_cell_end_indices,
     const float3* __restrict__ d_sum_movement_pressure,
-    const float3* __restrict__ d_grad_coup_vect, int num_particles,
+    const float3* __restrict__ d_grad_coup_vect, int num_fluid,
     SimulationParams params, float delta_time);
 
 /* Predicted density after the pressure update.
  * rho_i^{l+1} = rho_i^adv + a_ii p_i + sum_j m_j (sum d_ij p_j - d_jj p_j
- *   - sum_{k != i} d_jk p_k) · grad W_ij
- * Ihmsen et al., p. 4 (rearrangement of Eq. (13));
- * thesis p. 12, Eq. (4.7), evaluated after p^{l+1} is assigned
- * (thesis p. 24, Algorithm 6). */
+ *   - sum_{k != i} d_jk p_k) · grad W_ij + sum_b Psi_b (sum_j d_ij p_j) · grad W_ib
+ * Ihmsen et al., p. 6 (density correction after Eq. (14), with the same
+ * terms as Eq. (16)); thesis p. 12, Eq. (4.7), evaluated after p^{l+1} is
+ * assigned (thesis p. 24, Algorithm 6). */
 __global__ void
-updateDensityKernel(const float3* __restrict__ d_pos,
+updateDensityKernel(const float3* __restrict__ d_pos, BoundaryParticles boundary,
                     const float* __restrict__ d_density,
                     const float* __restrict__ d_density_adv,
                     const float* __restrict__ d_diag_coeff,
@@ -199,23 +238,46 @@ updateDensityKernel(const float3* __restrict__ d_pos,
                     const unsigned int* __restrict__ d_cell_start_indices,
                     const unsigned int* __restrict__ d_cell_end_indices,
                     const float3* __restrict__ d_sum_movement_pressure,
-                    const float3* __restrict__ d_grad_coup_vect,
-                    int num_particles, SimulationParams params,
-                    float delta_time);
+                    const float3* __restrict__ d_grad_coup_vect, int num_fluid,
+                    SimulationParams params, float delta_time);
+
+/* Pipe inlet zone: both only simulate closed boxes.
+ * Fluid whose position before integration had s = (x - origin) · axis below
+ * zone_length moves at the prescribed speed along the axis, like a piston:
+ *   v = speed * axis, x(t+dt) = x(t) + dt * v
+ * Its pressure still pushes on the fluid downstream through Eqs. (2) and (16). */
+__global__ void applyInflowKernel(float3* __restrict__ d_pos,
+                                  const float3* __restrict__ d_pos_before,
+                                  float3* __restrict__ d_vel, int num_fluid,
+                                  float3 origin, float3 axis, float zone_length,
+                                  float speed, float delta_time);
+
+/* Pipe outlet. Flags fluid to keep: 1 while
+ * s = (x - origin) · axis <= outlet_s and x is inside the domain, otherwise 0. */
+__global__ void markOutflowKernel(const float3* __restrict__ d_pos,
+                                  unsigned char* __restrict__ d_keep, int num_fluid,
+                                  float3 origin, float3 axis, float outlet_s,
+                                  float3 domain_max, SimulationParams params);
 
 /* Integration. Pressure force, then semi-implicit Euler.
  * F_i^p = -m_i * sum_j m_j (p_i/rho_i^2 + p_j/rho_j^2) grad W_ij
  *   Ihmsen et al., p. 2, Eq. (2); thesis p. 14, Eq. (4.12).
+ * F_{i<-b}^p = -m_i Psi_b(rho_0) p_i / rho_i^2 grad W_ib
+ *   Ihmsen et al., p. 6, Eq. (15).
  * v_i(t+dt) = v_i^adv + dt * F_i^p / m_i
  * x_i(t+dt) = x_i + dt * v_i(t+dt)
  *   Ihmsen et al., p. 3, Algorithm 1; thesis p. 8 lines 21–22 and p. 14.
+ * Only fluid particles are integrated. Boundary particles do not update
+ * their positions or velocities (thesis pp. 19 and 25).
  * New positions are written separately so every thread still reads the
  * positions from the pressure solve. */
 __global__ void integrateKernel(
-    const float3* __restrict__ d_pos, float3* __restrict__ d_pos_next,
-    float3* __restrict__ d_vel, const float3* __restrict__ d_vel_adv,
-    const float* __restrict__ d_density, const float* __restrict__ d_pressure,
+    const float3* __restrict__ d_pos, BoundaryParticles boundary,
+    float3* __restrict__ d_pos_next, float3* __restrict__ d_vel,
+    const float3* __restrict__ d_vel_adv, const float* __restrict__ d_density,
+    const float* __restrict__ d_pressure,
     const unsigned int* __restrict__ d_sorted_values,
     const unsigned int* __restrict__ d_cell_start_indices,
-    const unsigned int* __restrict__ d_cell_end_indices, int num_particles,
+    const unsigned int* __restrict__ d_cell_end_indices, int num_fluid,
     SimulationParams params, float delta_time);
+

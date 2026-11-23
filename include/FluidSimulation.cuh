@@ -1,7 +1,11 @@
 #pragma once
 
+#include "Kernels.cuh"
+#include "PipeGenerator.hpp"
 #include "SimulationParams.cuh"
+#include <algorithm>
 #include <cuda_runtime.h>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -13,6 +17,19 @@ private:
     float h_density_error_threshold = 0.0f;
     int h_active_particle_count = 0;
     float3 h_start_vel = make_float3(0.0f, 0.0f, 0.0f);
+
+    // Static boundary particles (pipe walls). Ihmsen et al., p. 5, Section 4.
+    int h_max_boundary_particles = 0;
+    int h_boundary_particle_count = 0;
+    bool h_boundary_psi_dirty = false;
+
+    // Optional pipe from the "pipe" config block, with its inlet and outlet
+    std::optional<PipeSpec> h_pipe;
+    float h_fluid_spacing = 0.0f; // rest spacing, cbrt(m / rho_0)
+    float3 h_domain_max = make_float3(0.0f, 0.0f, 0.0f);
+    std::vector<float3> h_inflow_layer; // one cross-section of inlet fluid
+    float h_inflow_distance = 0.0f;     // inlet travel since the last layer
+    bool h_capacity_warned = false;
 
     // Grid sizing metadata calculated on host during initialization
     int h_grid_width = 0;
@@ -41,6 +58,16 @@ private:
     float* d_diag_coeff = nullptr;             // a_ii
     float3* d_sum_movement_pressure = nullptr; // SUM_j(d_ij * p_j^l)
 
+    // Boundary particle buffers
+    float3* d_boundary_pos = nullptr; // x_b, never integrated
+    float* d_boundary_psi = nullptr;  // Psi_b(rho_0) = rho_0 / delta_b
+
+    // Outlet compaction (CUB DeviceSelect::Flagged)
+    unsigned char* d_keep_flags = nullptr;
+    int* d_num_selected = nullptr;
+    void* d_select_temp_storage = nullptr;
+    size_t h_select_temp_storage_bytes = 0;
+
     // Spatial Hashing & CUB Sort Buffers
     unsigned int* d_keys_in = nullptr;
     unsigned int* d_keys_out = nullptr;
@@ -58,6 +85,19 @@ private:
 
     bool pointers_allocated = false;
 
+    int activeFluidCount() const {
+        return std::min(h_active_particle_count, h_max_particles);
+    }
+    BoundaryParticles boundaryView() const {
+        return BoundaryParticles{d_boundary_pos, d_boundary_psi};
+    }
+
+    void loadPipe(const PipeSpec& spec);
+    bool appendFluidParticles(const std::vector<float3>& positions,
+                              const std::vector<float3>& velocities);
+    void emitInflow(float delta_time);
+    void removeOutflowParticles();
+
 public:
     FluidSimulation() = default;
     ~FluidSimulation();
@@ -68,8 +108,21 @@ public:
     void updateSpatialHash();
     void cleanup();
 
+    /* Replaces the static boundary particles, e.g. samples of the pipe walls.
+     * Positions must lie inside the domain. Psi_b is recomputed on the next
+     * spatial hash. */
+    void uploadBoundaryParticles(const std::vector<float3>& positions);
+
     // Debug Functions
     int getMaxParticles() const { return h_max_particles; }
+    int getMaxBoundaryParticles() const { return h_max_boundary_particles; }
+    int getBoundaryParticleCount() const { return h_boundary_particle_count; }
+    int getActiveParticleCount() const { return activeFluidCount(); }
+    float getFluidSpacing() const { return h_fluid_spacing; }
+    const PipeSpec* getPipe() const { return h_pipe ? &*h_pipe : nullptr; }
+    int getInflowLayerSize() const {
+        return static_cast<int>(h_inflow_layer.size());
+    }
     int getMaxIterations() const { return h_max_iterations; }
     float getDensityErrorThreshold() const { return h_density_error_threshold; }
     const SimulationParams& getParams() const { return h_params; }
@@ -95,4 +148,6 @@ public:
     std::vector<float> copyPressureToHost() const;
     std::vector<float> copyPredictedDensitiesToHost() const;
     std::vector<float> copyPrevPressureToHost() const;
+    std::vector<float3> copyBoundaryPositionsToHost() const;
+    std::vector<float> copyBoundaryPsiToHost() const;
 };
