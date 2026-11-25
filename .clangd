@@ -17,6 +17,9 @@ CompileFlags:
     - -I/home/bwolek/FluidSim/tests
     - -I/home/bwolek/FluidSim/libraries/nlohmann/include
     - -I/home/bwolek/FluidSim/libraries/glad/include
+    - -I/home/bwolek/FluidSim/libraries/imgui-1.93.0
+    - -I/home/bwolek/FluidSim/libraries/imgui-1.93.0/backends
+    - -I/home/bwolek/FluidSim/libraries/glfw-3.5.1/include
 
     - --cuda-gpu-arch=sm_89
     - -std=c++20
@@ -59,6 +62,9 @@ CompileFlags:
     - -I/home/bwolek/FluidSim/tests
     - -I/home/bwolek/FluidSim/libraries/nlohmann/include
     - -I/home/bwolek/FluidSim/libraries/glad/include
+    - -I/home/bwolek/FluidSim/libraries/imgui-1.93.0
+    - -I/home/bwolek/FluidSim/libraries/imgui-1.93.0/backends
+    - -I/home/bwolek/FluidSim/libraries/glfw-3.5.1/include
 Diagnostics:
   Suppress:
     - "variadic_device_fn"

@@ -9,7 +9,11 @@ set(CMAKE_CUDA_COMPILER "/usr/local/cuda-13.4/bin/nvcc")
 # Target the RTX 4060 Mobile architecture (Ada Lovelace, Compute Capability 8.9)
 set(CMAKE_CUDA_ARCHITECTURES 89)
 
-project(FluidSim LANGUAGES CXX CUDA)
+# Link the CUDA runtime into the executable. Must be set before project() so
+# nvcc does not also pull in the shared libcudart.
+set(CMAKE_CUDA_RUNTIME_LIBRARY Static)
+
+project(FluidSim LANGUAGES C CXX CUDA)
 
 # Enforce C++20 standard for both host (CPU) and device (GPU) code
 set(CMAKE_CXX_STANDARD 20)
@@ -17,11 +21,27 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CUDA_STANDARD 20)
 set(CMAKE_CUDA_STANDARD_REQUIRED ON)
 
+# CUDA 13's CCCL headers reject MSVC's traditional preprocessor. nvcc does not
+# pass /Zc:preprocessor on its own, so the host compiler has to be told here.
+if(MSVC)
+    add_compile_options(
+        $<$<COMPILE_LANGUAGE:CXX>:/Zc:preprocessor>
+        $<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/Zc:preprocessor>
+    )
+endif()
+
 # Find CUDA toolkit explicitly
 find_package(CUDAToolkit 13.4 REQUIRED)
 
-# Find required windowing and graphics libraries
-find_package(glfw3 REQUIRED)
+# Build the vendored GLFW. Docs, tests, and examples are not needed, and
+# Wayland pulls in extra system packages the X11 backend does not.
+set(GLFW_BUILD_DOCS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_TESTS OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
+set(GLFW_INSTALL OFF CACHE BOOL "" FORCE)
+set(GLFW_BUILD_WAYLAND OFF CACHE BOOL "" FORCE)
+add_subdirectory(libraries/glfw-3.5.1)
+
 find_package(OpenGL REQUIRED)
 
 # Tell CMake where to look for header files
@@ -29,6 +49,9 @@ include_directories(${CMAKE_CURRENT_SOURCE_DIR}/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/src)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/glad/include)
 include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/nlohmann/include)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/imgui-1.93.0)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/imgui-1.93.0/backends)
+include_directories(${CMAKE_CURRENT_SOURCE_DIR}/libraries/glfw-3.5.1/include)
 include_directories(${CUDAToolkit_INCLUDE_DIRS})
 
 # -----------------------------------------------------------------------------
@@ -48,13 +71,21 @@ add_executable(FluidSim
     src/FluidSimulation.cu
     src/Kernels.cu
     src/PipeGenerator.cpp
+    src/RenderPack.cu
+    src/FluidView.cpp
     libraries/glad/src/glad.c
+    libraries/imgui-1.93.0/imgui.cpp
+    libraries/imgui-1.93.0/imgui_draw.cpp
+    libraries/imgui-1.93.0/imgui_tables.cpp
+    libraries/imgui-1.93.0/imgui_widgets.cpp
+    libraries/imgui-1.93.0/backends/imgui_impl_glfw.cpp
+    libraries/imgui-1.93.0/backends/imgui_impl_opengl3.cpp
 )
 
 target_link_libraries(FluidSim PRIVATE 
     glfw 
     OpenGL::GL 
-    CUDA::cudart
+    CUDA::cudart_static
     CUDA::cuda_driver
 )
 
@@ -67,7 +98,7 @@ add_executable(FluidSimTest
 )
 
 target_link_libraries(FluidSimTest PRIVATE 
-    CUDA::cudart
+    CUDA::cudart_static
     CUDA::cuda_driver
 )
 

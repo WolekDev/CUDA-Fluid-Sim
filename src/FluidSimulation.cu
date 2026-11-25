@@ -13,6 +13,16 @@ using json = nlohmann::json;
 /* Destructor to release all allocated memory. */
 FluidSimulation::~FluidSimulation() { cleanup(); }
 
+FluidSimulation::DeviceFields FluidSimulation::deviceFields() const {
+    return {d_pos,
+            d_vel,
+            d_pressure,
+            d_density,
+            activeFluidCount(),
+            d_boundary_pos,
+            h_boundary_particle_count};
+}
+
 /* Init function. Allocates memory and prepares variables from config. */
 void FluidSimulation::initialize(const std::string& config_file) {
     // Open config file and create JSON object
@@ -491,6 +501,9 @@ void FluidSimulation::uploadBoundaryParticles(
 void FluidSimulation::cleanup() {
     if (!pointers_allocated)
         return;
+
+    // Finish in-flight kernels before the buffers they read are released.
+    cudaDeviceSynchronize();
 
     cudaFree(d_pos);
     cudaFree(d_pos_next);

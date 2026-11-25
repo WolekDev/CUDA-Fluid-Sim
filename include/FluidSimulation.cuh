@@ -134,6 +134,20 @@ public:
                pointers_allocated;
     }
 
+    /* Device arrays for the viewer. Pointers stay owned by the simulation
+     * and are valid until the next initialize or cleanup. count is the
+     * active fluid particles. */
+    struct DeviceFields {
+        const float3* positions = nullptr;
+        const float3* velocities = nullptr;
+        const float* pressures = nullptr;
+        const float* densities = nullptr;
+        int count = 0;
+        const float3* boundary_positions = nullptr;
+        int boundary_count = 0;
+    };
+    DeviceFields deviceFields() const;
+
     // Test Helper Methods
     void uploadTestParticles(const std::vector<float3>& pts);
     void uploadTestVelocities(const std::vector<float3>& velocities);

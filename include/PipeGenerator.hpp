@@ -72,6 +72,19 @@ float pipeCircumradiusAt(const PipeSpec& spec, float axial_position);
 /* Axial position of a world-space point. */
 float pipeAxialCoordinate(const PipeSpec& spec, float3 position);
 
+/* Orthonormal frame of the pipe. A world point is
+ * origin + s * axis + u_offset * u + w_offset * w.
+ * w is the cross-section direction closest to world up, so a longitudinal
+ * slice in the (axis, w) plane stands upright. */
+struct PipeCrossSectionFrame {
+    float3 origin = make_float3(0.0f, 0.0f, 0.0f);
+    float3 axis = make_float3(1.0f, 0.0f, 0.0f);
+    float3 u = make_float3(0.0f, 0.0f, 1.0f);
+    float3 w = make_float3(0.0f, 1.0f, 0.0f);
+};
+
+PipeCrossSectionFrame pipeCrossSectionFrame(const PipeSpec& spec);
+
 /* Wall particles for every layer. Rings are spaced wall_spacing apart,
  * measured along the (possibly sloped) wall. Points in each ring are spaced
  * at most wall_spacing apart, and every polygon corner gets a point. */

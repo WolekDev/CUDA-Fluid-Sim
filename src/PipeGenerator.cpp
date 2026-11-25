@@ -288,6 +288,16 @@ float pipeAxialCoordinate(const PipeSpec& spec, float3 position) {
     return static_cast<float>(dot(offset_from_inlet, axis));
 }
 
+PipeCrossSectionFrame pipeCrossSectionFrame(const PipeSpec& spec) {
+    const CrossSectionFrame frame = makeCrossSectionFrame(spec);
+    auto asFloat3 = [](Vec3 v) {
+        return make_float3(static_cast<float>(v.x), static_cast<float>(v.y),
+                           static_cast<float>(v.z));
+    };
+    return {asFloat3(frame.origin), asFloat3(frame.axis), asFloat3(frame.u),
+            asFloat3(frame.w)};
+}
+
 PipeWall generatePipeWall(const PipeSpec& spec) {
     if (spec.wall_spacing <= 0.0f)
         throw std::runtime_error("pipe wall_spacing must be positive");
